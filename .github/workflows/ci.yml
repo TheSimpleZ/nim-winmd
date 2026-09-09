@@ -1,0 +1,73 @@
+name: CI
+on:
+  push:
+    branches:
+      - master
+      - test-*
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      branch:
+        default: '" ~= 2.2.0"'
+
+concurrency: # Cancel stale PR builds (but not push builds)
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: ${{ fromJSON(format('[{0}]', inputs.branch || '" ~= 2.2.0","#devel"')) }}
+
+    name: 'nim ${{matrix.branch}}'
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          # the windows-rs submodule (pinned in the superproject) provides
+          # the winmd and the per-header RDL snapshot the tests and
+          # generator consume
+          submodules: true
+
+      - uses: nim-lang/setup-nimble-action@v1
+        with:
+          nimble-version: nightly
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up MinGW
+        uses: egor-tensin/setup-mingw@v3
+        with:
+          platform: x64
+
+      - name: Install Nim
+        run: nimble install --requires="nim${{matrix.branch}}"
+
+      - name: Run test suites (nimble test)
+        shell: pwsh
+        run: |
+          # the tests use the windows-rs submodule at the repo root
+          nimble test
+
+      - name: "checkAbi"
+        shell: pwsh
+        run: |
+          nimble checkabi
+
+      - name: Full-surface compile (all generated modules)
+        shell: pwsh
+        run: |
+          nimble fullcheck
+  lint:
+    name: "Check formatting"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Check `nph` formatting
+        uses: arnetheduck/nph-action@v1
+        with:
+          version: 0.7.0
+          options: "."

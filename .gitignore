@@ -1,0 +1,14 @@
+nimble.develop
+nimble.paths
+nimbledeps
+/tests/test_generator
+/tests/test_model
+/tests/test_signatures
+/tests/test_winmd
+/winmd2nim
+/winmd2yaml
+/checkabi
+/win32abi
+/tools/checkabi
+/tools/win32abi
+*.exe
