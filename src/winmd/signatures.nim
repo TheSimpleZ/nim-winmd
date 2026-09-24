@@ -254,6 +254,20 @@ proc decodeFieldSig*(wa: Winmd, blob: seq[byte]): SigType =
     badBlob(0, "field signature blob missing 0x06 prolog")
   readType(wa, c)
 
+## The named leaf of a type tree (through pointer / by-ref / array
+## decorators).
+proc namedLeaf*(ty: SigType): SigType =
+  var cur = ty
+  while cur.base == bPtr or cur.base == bByRef or cur.base == bArray:
+    cur = cur.inner[]
+  cur
+
+## The named type at the leaf of a type tree (through pointer/by-ref/array
+## decorators); "" when the leaf is a primitive.
+proc leafNamed*(ty: SigType): string =
+  let cur = namedLeaf(ty)
+  if cur.base == bNamed: cur.name else: ""
+
 ## Decode a method signature blob: flags, param count, return type, params.
 proc decodeMethodSig*(wa: Winmd, blob: seq[byte]): MethodSig =
   var c: Cursor

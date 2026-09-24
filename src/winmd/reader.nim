@@ -852,22 +852,26 @@ proc string*(wa: Winmd, idx: int): string =
 
 proc compressedLen(b: openArray[byte], p: int): (int, int) =
   ## (value, bytes consumed) for a metadata compressed integer.
+  ## https://github.com/stakx/ecma-335/blob/f181e4696eebcbbc7c2b1e5d0a2ee289f2884d2d/docs/ii.24.2.4-us-and-blob-heaps.md
   let b0 = b[p]
   case b0 shr 5
   of 0 .. 3:
-    (int(b0), 1)
+    (int(b0 and 0x7F), 1)
   of 4 .. 5:
-    (int(b0 and 0x3F) or (int(b[p + 1]) shl 7), 2)
+    (int(b0 and 0x3F) shl 8 or int(b[p + 1]), 2)
   else:
-    ((int(b0 and 0x1F) shl 14) or (int(b[p + 1]) shl 7) or int(b[p + 2]), 3)
+    (
+      (int(b0 and 0x1F) shl 24) or (int(b[p + 1]) shl 16) or int(b[p + 2]) shl 8 or
+        int(b[p + 3]),
+      4,
+    )
 
 ## Decode a #Blob heap entry: `idx` points at a compressed-length prefix
 ## followed by the blob bytes (prefix stripped in the result).
 proc blob*(wa: Winmd, idx: int): seq[byte] =
   let off = wa.blobsOff + idx
   let (n, len) = compressedLen(wa.data, off)
-  result = @[]
-  result.add(wa.data[off + len ..< off + len + n])
+  wa.data[off + len ..< off + len + n]
 
 ## True if the #Strings heap contains the exact string `s` (i.e. some string
 ## entry equals `s`, followed by a NUL).

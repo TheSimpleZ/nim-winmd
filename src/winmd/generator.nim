@@ -8,21 +8,35 @@
 #   3. opaque stubs for named types referenced in signatures but not
 #      defined in this winmd (a stub referenced by several modules
 #      lives in the earliest one)
-#   4. one `type` section: handles (distinct), enums (scoped as real
+#   4. one `type` section: handles (plain aliases), enums (scoped as real
 #      enums; unscoped as an alias of the backing integer), structs
 #      (objects), delegates (proc types), interfaces (opaque objects);
 #      architecture-split names get selector aliases between two type
 #      zones (types referencing them come after the aliases)
-#   5. `const` section: free constants + unscoped-enum members
-#   6. functions: each proc sits in its owning module, sorted by DLL
-#      then name and grouped per export DLL:
-#      `{.push dynlib: "x".} ... {.pop.}` (one push/pop pair per DLL);
-#      the dynlib name is lowercased with the .dll suffix stripped;
-#      the importc pragma is bare when the emitted name is exactly the
-#      C name, and spelled when --lowercase lowercases the first letter;
-#      --headers attaches a `header: "stem.h"` pragma to symbols with
-#      known provenance
-#   7. curated aliases: the LPSTR/PSTR family -> cstring, the wide
+#   5. file-level pragmas: `{.pragma: mdmethod, sideEffect.}` bundles
+#      the pragmas shared by all of the module's functions; mdtype
+#      (which includes completeStruct, part of every struct) and
+#      mdalias cover the structs (objects, incl. opaque stubs) and
+#      the aliases (handles, enums, unscoped enums, delegates)
+#      respectively, and mdinterface the interfaces — a struct emits
+#      only its per-struct pragmas (union / packed) plus mdtype. With
+#      --headers, a `when defined(checkAbi) or defined(mdheaders):`
+#      block defines `{.pragma: mdheader, header: "stem.h".}` (empty in
+#      the else branch) for the module's defining header, and
+#      mdmethod/mdtype/mdalias/mdinterface include mdheader; a header
+#      that cannot be included directly in the C file (noDirectInclude,
+#      e.g. winnt.h) is replaced by headerIncludeOverride (winnt ->
+#      windef) or gets no mdheader at all
+#   6. `const` section: free constants + unscoped-enum members
+#   7. functions: each proc sits in its owning module, sorted by DLL
+#      then name; one `{.push dynlib: "x".} ...` `{.pop.}` pair per DLL
+#      (a single header module may span several export DLLs, so the
+#      dynlib never moves into the file-level pragmas); the dynlib name
+#      is lowercased with the .dll suffix stripped; the importc pragma
+#      is bare when the emitted name is exactly the C name, and spelled
+#      when --lowercase lowercases the first letter; every fn uses
+#      mdmethod
+#   8. curated aliases: the LPSTR/PSTR family -> cstring, the wide
 #      variants -> ptr UncheckedArray[uint16]; redundant A-suffix
 #      aliases (X with X & "A" == target) are not emitted, references
 #      resolve to the target
@@ -41,113 +55,32 @@
 # the first occurrence and suffixes later duplicates with `_2`, `_3`, ...
 # so the output is always valid Nim. Escaping uses backticks for Nim
 # keywords / digit-leading names.
+#
+# The naming phase (emitted names, stubs, arch variants, suppressed
+# aliases, name-level reference data) lives in nameplan.nim and produces
+# the NamePlan this file lays out and renders.
 
-import std/[sequtils, strutils, algorithm, sets, tables]
-import ./[model, signatures]
-
-# Keywords and reserved names
-const NimKeywords = @[
-  "addr", "and", "as", "bind", "break", "case", "concept", "const", "continue", "defer",
-  "discard", "distinct", "elif", "else", "enum", "except", "export", "finally", "for",
-  "from", "if", "in", "include", "interface", "is", "isnot", "iterator", "let", "macro",
-  "method", "mixin", "namespace", "nil", "not", "notin", "object", "of", "or", "out",
-  "proc", "ptr", "raise", "ref", "return", "static", "template", "try", "tuple", "type",
-  "using", "var", "when", "while", "yield", "with", "without", "converter", "mod",
-  "asm", "func", "do", "end", "bool", "byte", "char", "int", "int8", "int16", "int32",
-  "int64", "uint", "uint8", "uint16", "uint32", "uint64", "float", "float64", "float32",
-  "pointer", "ptr",
-]
+import std/[strutils, algorithm, sets, tables]
+import ./[model, signatures, nameplan]
 
 type GenCtx = object
   text: string
-  knownTypes: HashSet[string] # type names emitted by section 3
-  usedNames: HashSet[string] # every top-level name used so far
-  unknownTypes: HashSet[string] # referenced but not emitted -> stubs
-  guidUsed: bool # a signature references System.Guid (TypeRef)
-  nameMap: Table[string, string] # "ns/name" or "name" -> emitted type name
-  dupRowEmit: Table[int, string]
-    # TypeDef row -> emitted name, for names shared by multiple rows
-    # (anonymous nested types); nameMap alone cannot disambiguate them
-  stubNames: Table[string, string] # unknown type name -> emitted stub name
-  typePrims: Table[string, Prim] # type name -> base primitive kind
-  typePtr: HashSet[string] # type base is a pointer-ish type
-  typeKind: Table[string, TypeKind] # type name -> kind (first row wins)
-  aAlias: Table[string, string]
-    # suppressed A-suffix alias: X -> Y (raw names)
-    # a handle X whose underlying type is a named type Y with X & "A" == Y
-    # (STARTUPINFOEX -> STARTUPINFOEXA): the emitted alias adds nothing, so
-    # it is not emitted and every reference to X resolves to Y's name
-  aAliasFinal: Table[string, string] # X -> emitted name references resolve to
   typeHdr: Table[string, string] # symbol name -> defining header stem
 
-  emitHeaders: bool
-    # the --headers option: attach `header: "stem.h"`
-    # to every type and function with known RDL provenance (the compiler
-    # then treats it as declared in the named C header: no C declaration
-    # is emitted, and -d:checkAbi can verify the layout against the real
-    # headers). Constants get no pragma: `header` implies `nodecl`, so
-    # the C code would reference a symbol the named header need not
-    # declare
   lowerFirst: bool
     # the --lowercase option: lowercase the first letter
     # of emitted function names (Nim convention); off by default, the
     # importc pragma keeps the real linkage name either way
 
-proc addGrouped[A; B](t: var Table[A, seq[B]], a: A, b: sink B) =
-  t.mGetOrPut(a, default(seq[B])).add b
-
 proc line(c: var GenCtx, s: string) =
   c.text.add s
   c.text.add '\n'
-
-## Escape a Nim identifier (backtick keywords / digit-leading names).
-proc esc(s: string): string =
-  if s.len == 0:
-    ""
-  elif s in NimKeywords or s[0] in {'0' .. '9'}:
-    '`' & s & '`'
-  else:
-    s
-
-## Register a top-level Nim name (the entry's nimName); on collision
-## return `name_2`, `name_3`, ...
-proc freshIdent(used: var HashSet[string], nimName: string): string =
-  result = nimName
-
-  var n0 = nimIdentNormalize(nimName)
-  if n0 in used:
-    var n = 2
-
-    while true:
-      let candidate = nimIdentNormalize(result & "_" & $n)
-      if candidate in used:
-        inc n
-      else:
-        n0 = candidate
-        result = result & "_" & $n
-        break
-  used.incl n0
-
-## Register a top-level name; on collision return `name_2`, `name_3`, ...
-proc freshName(c: var GenCtx, nimName: string): string =
-  c.usedNames.freshIdent(nimName)
 
 proc renderPragma(pragmas: openArray[string]): string =
   if pragmas.len > 0:
     " {." & pragmas.join(", ") & ".}"
   else:
     ""
-
-proc archSuffix(archs: set[Architecture]): string =
-  for arch in archs:
-    if result.len > 0:
-      result.add '_'
-    result.add (
-      case arch
-      of i386: "I386"
-      of amd64: "AMD64"
-      of arm64: "ARM64"
-    )
 
 ## `defined(...)` condition covering an entry's arch set (for the
 ## `when` blocks of arch-tagged constants).
@@ -158,270 +91,18 @@ proc archCond(archs: set[Architecture]): string =
 
     result.add "defined(" & $arch & ")"
 
-## `header: "stem.h"` pragma expression for a symbol with known RDL
-## provenance (the --headers option); "" otherwise. The header pragma
-## makes the compiler treat the symbol as declared in the named C header:
-## no C declaration is emitted, and with -d:checkAbi a NIM_STATIC_ASSERT
-## verifies the Nim layout against the real header. Callers wrap it in
-## a ` {. ... .}` block as needed.
-proc headerPragma(c: GenCtx, rawName: string): seq[string] =
-  if c.emitHeaders and rawName in c.typeHdr:
-    @["header: \"" & c.typeHdr[rawName] & ".h\""]
-  else:
-    @[]
+# Headers that cannot be included directly in the generated C file
+# (their preprocessor state clashes with the Nim runtime C file). Keep
+# the list short; for each, headerIncludeOverride names the replacement
+# header to include instead ("" = no header pragma at all).
+const noDirectInclude = @["winnt"]
 
-## The header pragma as a standalone ` {.header: "h".}` block ("" when
-## unknown) — for emission lines without an existing pragma block.
-proc headerBlock(c: GenCtx, rawName: string): string =
-  renderPragma(c.headerPragma(rawName))
-
-## Name for an unknown (stubbable) type; falls back to the fixed identifier
-## before pass 1 has assigned stub names.
-proc stubName(c: var GenCtx, name: string): string =
-  if name in c.stubNames:
-    esc(c.stubNames[name])
-  else:
-    esc(fixIdent(name))
-
-## Render a leaf (bPrim/bNamed) SigType; decorators are handled by renderType.
-proc renderLeaf(c: var GenCtx, t: SigType): string =
-  case t.base
-  of bPrim:
-    case t.prim
-    of pvVoid: "void"
-    of pvBoolean: "bool"
-    of pvChar: "char"
-    of pvI1: "int8"
-    of pvU8: "uint64"
-    of pvU1: "uint8"
-    of pvI2: "int16"
-    of pvU2: "uint16"
-    of pvI4: "int32"
-    of pvU4: "uint32"
-    of pvI8: "int64"
-    of pvR4: "float32"
-    of pvR8: "float64"
-    of pvString: "ptr UncheckedArray[uint16]"
-    of pvI: "int"
-    of pvU: "uint"
-  of bNamed:
-    if t.rowIdx >= 0 and t.rowIdx in c.dupRowEmit:
-      # name shared by multiple TypeDef rows: resolve by row, not name
-      esc(c.dupRowEmit[t.rowIdx])
-    elif t.name in c.knownTypes:
-      let k = t.ns & "/" & t.name
-      if k in c.nameMap:
-        esc(c.nameMap[k])
-      elif t.name in c.nameMap:
-        esc(c.nameMap[t.name])
-      else:
-        esc(fixIdent(t.name))
-    elif t.ns == "System":
-      case t.name
-      of "Object":
-        "pointer"
-      of "Void":
-        "void"
-      of "Char":
-        "char"
-      of "Boolean":
-        "bool"
-      of "Int32":
-        "int32"
-      of "UInt32":
-        "uint32"
-      of "Int64":
-        "int64"
-      of "UInt64":
-        "uint64"
-      of "IntPtr":
-        "int"
-      of "UIntPtr":
-        "uint"
-      of "Guid":
-        # 16-byte struct (TypeRef to mscorlib, not a TypeDef in this
-        # winmd): emit the real layout in the base module, not a
-        # 0-byte opaque stub
-        c.guidUsed = true
-        "Guid"
-      else:
-        c.unknownTypes.incl t.name
-        stubName(c, t.name)
-    else:
-      c.unknownTypes.incl t.name
-      stubName(c, t.name)
-  else:
-    "void" # decorators are dispatched by renderType
-
-proc renderType(c: var GenCtx, t: SigType): string # fwd (mutual recursion)
-
-## Render a fixed-size array element: a by-ref element becomes a pointer
-## (`array[var T, N]` is not valid Nim), everything else renders as-is.
-proc renderArrElem(c: var GenCtx, e: SigType): string =
-  if e.base == bByRef:
-    "ptr " & renderType(c, e.inner[])
-  else:
-    renderType(c, e)
-
-## Render a full SigType as a Nim type expression (walks the decorator tree).
-proc renderType(c: var GenCtx, t: SigType): string =
-  case t.base
-  of bPrim, bNamed:
-    renderLeaf(c, t)
-  of bPtr:
-    let s = renderType(c, t.inner[])
-    # `ptr void` is not a legal Nim type; a pointee that is an alias for
-    # *void* (a handle typedef whose resolved base primitive is pvVoid,
-    # e.g. MENUTEMPLATEA) must render as the bare `pointer` too. A pointee
-    # that is an alias for *pointer* (a `ptr void` typedef, e.g. SC_HANDLE)
-    # is in typePtr and must stay `ptr <name>` (= `ptr pointer`), not be
-    # collapsed to `pointer`
-    if s == "void" or (
-      t.inner[].base == bNamed and t.inner[].name in c.typePrims and
-      c.typePrims[t.inner[].name] == pvVoid and t.inner[].name notin c.typePtr
-    ):
-      "pointer"
-    else:
-      "ptr " & s
-  of bByRef:
-    "var " & renderType(c, t.inner[])
-  of bArray:
-    "array[" & $t.arrLen & ", " & renderArrElem(c, t.inner[]) & "]"
-
-## True if the rendered form of `t` is already a unique/distinct type, so a
-## handle aliasing it (or a pointer to it) needs no `distinct` keyword. A
-## pointer is unique iff its pointee is: a `ptr` of an already-distinct type
-## is itself distinct (like `ptr SomeObject`, objects being implicitly
-## distinct). Objects, stubs, scoped enums and distinct handles are unique;
-## primitives, `pointer`, void-aliases and unscoped enums are shared.
-proc isUniqueType(c: GenCtx, t: SigType): bool =
-  case t.base
-  of bPrim:
-    false
-  of bNamed:
-    let n = t.name
-    if n in c.stubNames:
-      true
-    elif n in c.typeKind:
-      case c.typeKind[n]
-      of tkStruct, tkInterface, tkEnum, tkDelegate:
-        true
-      of tkUnscopedEnum:
-        false
-      of tkHandle:
-        # a handle is unique unless it is a void-alias (a plain `void`
-        # alias, shared)
-        not (n in c.typePrims and c.typePrims[n] == pvVoid and n notin c.typePtr)
-    else:
-      true # unknown -> stub (`distinct object`)
-  of bPtr:
-    isUniqueType(c, t.inner[])
-  of bByRef, bArray:
-    false
-
-## True if `t`'s rendered form is a pointer type: an anonymous `ptr ...`
-## or bare `pointer`, `cstring`, or a named typedef whose base is a
-## pointer. A non-zero value on such a type renders as a cast, which the
-## VM cannot evaluate at compile time (so the const becomes a template).
-proc renderedIsPtr(c: var GenCtx, t: SigType): bool =
-  var et = t
-  # constants on handle typedefs carry pvVoid; recover the base kind
-  if t.name.len > 0 and t.name in c.typePrims:
-    et.prim = c.typePrims[t.name]
-  let tyS = renderType(c, et)
-  tyS.len > 3 and tyS[0 .. 3] == "ptr " or tyS == "pointer" or
-    (t.name.len > 0 and t.name in c.typePtr)
-
-# ---------------------------------------------------------------------------
-# value rendering
-# ---------------------------------------------------------------------------
-
-const HexDigits = "0123456789abcdef"
-
-proc toHex(v: uint64): string =
-  if v == 0:
-    result = "0"
-    return
-  var x = v
-  while x > 0:
-    result.insert($HexDigits[int(x and 0x0F)], 0)
-    x = x shr 4
-
-## Render an integer constant with a typed literal suffix where the
-## bare decimal form would get the wrong default type (int64).
-proc renderIntConst(ty: Prim, v: uint64): string =
-  case ty
-  of pvU1:
-    "0x" & toHex(v) & "'u8"
-  of pvI1:
-    $cast[int8](v) & "'i8"
-  of pvU2:
-    "0x" & toHex(v) & "'u16"
-  of pvI2:
-    $cast[int16](v) & "'i16"
-  of pvU4:
-    "0x" & toHex(v) & "'u32"
-  of pvI4:
-    $cast[int32](v) & "'i32"
-  of pvU8:
-    "0x" & toHex(v) & "'u64"
-  of pvI8:
-    $cast[int64](v) & "'i64"
-  of pvI:
-    # no suffix: the bare literal is signed by default
-    $cast[int](v)
-  of pvU:
-    "0x" & toHex(v) & "'u"
-  else:
-    $cast[int64](v)
-
-## Default zero-initialized literal for a type expression.
-proc defaultLit(
-    c: var GenCtx, m: Model, firstIdx: Table[string, int], ty: SigType
-): string =
-  if ty.base == bArray:
-    # fixed array: zero-initialized value (array[<len>, <elem>] order)
-    return "array[" & $ty.arrLen & ", " & renderArrElem(c, ty.inner[]) & "]()"
-  if ty.base == bPtr or ty.base == bByRef or (ty.base == bPrim and ty.prim == pvString):
-    "nil"
-  elif ty.base == bNamed:
-    if ty.name in c.aAlias:
-      # suppressed alias: not emitted, the value is the target's
-      # zero literal
-      esc(c.aAliasFinal[ty.name]) & "()"
-    elif c.typeKind.getOrDefault(ty.name, tkStruct) == tkHandle and ty.name in c.typeKind and
-        c.typeKind[ty.name] == tkHandle:
-      # distinct base: wrap the base type's default
-      let j = firstIdx.getOrDefault(ty.name, -1)
-      if j >= 0:
-        esc(m.types[j].nimName) & "(" & defaultLit(
-          c, m, firstIdx, m.types[j].underlying
-        ) & ")"
-      else:
-        esc(fixIdent(ty.name)) & "()"
-    else:
-      esc(fixIdent(ty.name)) & "()"
-  else:
-    case ty.prim
-    of pvBoolean: "false"
-    of pvR4, pvR8: "0.0"
-    else: "0"
-
-## Render a constant value literal for a type of the given kind.
-proc renderConstValue(ty: SigType, c: ModelConst): string =
-  if c.isStr:
-    return escape(c.strVal)
-
-  if c.isFloat:
-    result = $(c.floatVal)
-    # an integer-valued float (e.g. "2") needs a decimal point or a
-    # float literal will be an int literal in Nim
-    if result.find('.') < 0 and result.find('e') < 0 and result.find('E') < 0 and
-        result.find('n') < 0 and result.find('i') < 0:
-      result.add ".0"
-    return
-
-  renderIntConst(ty.prim, c.value)
+## The header to include instead of a header in noDirectInclude
+## (winnt.h -> windef.h); "" when there is no replacement.
+proc headerIncludeOverride(stem: string): string =
+  case stem
+  of "winnt": "minwindef"
+  else: ""
 
 # ---------------------------------------------------------------------------
 # generate
@@ -506,196 +187,13 @@ proc dllModuleName(dll: string): string =
   s
 
 proc generateCore(
-    m: Model,
-    typeHdr: Table[string, string],
-    emitHeaders: bool,
-    lowerFirst: bool = false,
+    m: Model, typeHdr: Table[string, string], emitHeaders: bool, lowerFirst: bool
 ): tuple[base: string, mods: seq[FnModule], baseEmitted: bool] =
-  var c = GenCtx(emitHeaders: emitHeaders, typeHdr: typeHdr, lowerFirst: lowerFirst)
-
-  # ---- pass 0: assign emitted type names in emission order ---------------
-  # On a conservative-name collision, whoever is assigned first keeps the
-  # plain name. Order: structs first (signatures reference struct names),
-  # then handles, enums, delegates, interfaces.
-  var order: seq[int]
-  for i in 0 ..< m.types.len:
-    if m.types[i].kind == tkStruct:
-      order.add i
-  for i in 0 ..< m.types.len:
-    if m.types[i].kind == tkHandle:
-      order.add i
-  for i in 0 ..< m.types.len:
-    let k = m.types[i].kind
-    if k == tkEnum or k == tkUnscopedEnum:
-      order.add i
-  for i in 0 ..< m.types.len:
-    if m.types[i].kind == tkDelegate:
-      order.add i
-  for i in 0 ..< m.types.len:
-    if m.types[i].kind == tkInterface and m.types[i].name != "Apis":
-      order.add i
-
-  for r in NimKeywords:
-    c.usedNames.incl r
-
-  # names from implicitly-imported modules (system etc): a local declaration
-  # shadows them, but an *imported* one makes every reference ambiguous
-  for r in ["File", "Fileinfo"]:
-    c.usedNames.incl nimIdentNormalize(r)
-
-  var firstIdx: Table[string, int]
-  var rowCount: Table[string, int]
-  var nameRows: Table[string, seq[int]]
-  for i in 0 ..< m.types.len:
-    let nm0 = m.types[i].name
-    if nm0 notin firstIdx:
-      firstIdx[nm0] = i
-    rowCount[nm0] = rowCount.getOrDefault(nm0, 0) + 1
-    nameRows.addGrouped(nm0, i)
-
-  # ---- arch variants ------------------------------------------------------
-  # A name whose duplicate winmd rows each carry a distinct, non-zero
-  # SupportedArchitectureAttribute bitmask is a per-arch variant: the
-  # winmd keeps one row per arch set, and each row is emitted under a
-  # per-arch variant name (X_AMD64, X_I386, ...) while the plain name
-  # becomes a `when defined(...)` selector alias. The attribute is also
-  # present on km-merge chain sub-types (X_0, X_0_1, ...), so those split
-  # independently; variantName still names a chain after its split parent
-  # (X_AMD64_0_1), which is valid because the winmd keeps a parent and its
-  # chains in the same per-arch row order (variant i of both is the same
-  # arch set).
-  ## Sort rank of a const row: narrowest arch set first (untagged rows
-  ## would sort last; no emitted `when` group contains any).
-  proc rowArchRank(cc: ModelConst): int =
-    if cc.arch.len == 0: 99 else: cc.arch.len
-
-  var splitInfo: Table[string, seq[set[Architecture]]]
-  var rowVariant: seq[int] = newSeq[int](m.types.len)
-  for i in 0 ..< m.types.len:
-    rowVariant[i] = -1
-  for nm in nameRows.keys:
-    let rows = nameRows[nm]
-    if rows.len < 2:
-      continue
-    # only kinds whose per-arch definitions can differ meaningfully
-    let k = m.types[rows[0]].kind
-    if k != tkStruct and k != tkHandle and k != tkDelegate:
-      continue
-    # every row must carry a distinct, non-empty arch set
-    var ok = true
-    for i in 0 ..< rows.len:
-      if m.types[rows[i]].arch.len == 0:
-        ok = false
-        break
-      for j in i + 1 ..< rows.len:
-        if m.types[rows[i]].arch == m.types[rows[j]].arch:
-          ok = false
-          break
-      if not ok:
-        break
-    if ok:
-      var sets: seq[set[Architecture]]
-      for i in 0 ..< rows.len:
-        sets.add m.types[rows[i]].arch
-        rowVariant[rows[i]] = i
-      splitInfo[nm] = sets
-
-  var variantOut: Table[string, seq[string]]
-  # every variant — including km-merge chain sub-types — is named after
-  # its OWN arch set (X_AMD64, X_0_ARM64, ...). A chain's variant count
-  # can differ from its parent's (an arch may have no sub-struct for a
-  # given member), so the name must not be inherited from the parent.
-  proc variantName(nm: string, vi: int): string =
-    m.types[nameRows[nm][0]].nimName & "_" & archSuffix(splitInfo[nm][vi])
-
-  var spairs: seq[tuple[nm: string, l: seq[set[Architecture]]]]
-  for (nm, l) in splitInfo.pairs:
-    spairs.add (nm, l)
-  for (nm, l) in spairs:
-    for vi in 0 ..< l.len:
-      let v = c.freshName(variantName(nm, vi))
-      variantOut.addGrouped(nm, v)
-
-    let aliasN = m.types[nameRows[nm][0]].nimName
-    c.usedNames.incl nimIdentNormalize(aliasN)
-    c.nameMap[aliasN] = aliasN
-
-  var typeNames: seq[string] = newSeq[string](m.types.len)
-
-  for idx in order:
-    let t = m.types[idx]
-
-    c.knownTypes.incl t.name
-
-    let assigned =
-      if rowVariant[idx] >= 0:
-        # arch variant row: its unique per-arch name (no dedup suffix)
-        c.usedNames.incl nimIdentNormalize(t.nimName)
-        variantOut[t.name][rowVariant[idx]]
-      else:
-        c.freshName(t.nimName)
-    typeNames[idx] = assigned
-
-    if rowCount.getOrDefault(t.name, 0) > 1:
-      # keyed by the raw TypeDef row (model.resolveNested pins references
-      # to rows, not to m.types indices)
-      c.dupRowEmit[t.defRow] = assigned
-
-    if rowVariant[idx] >= 0:
-      # split names resolve through their selector alias (set above),
-      # not through a variant row
-      discard
-    else:
-      c.nameMap[t.ns & "/" & t.name] = assigned
-      c.nameMap[t.name] = assigned
-
-    # base primitive kind, following the named-type chain of handles
-    if t.kind == tkHandle or t.kind == tkUnscopedEnum:
-      var cur: SigType = t.underlying
-      var guard = 0
-      # stop at the first non-named leaf: a `ptr T` (bPtr) base makes the
-      # typedef pointer-like regardless of T. A chain that reaches an object
-      # (struct/interface) has no base primitive (a struct's `underlying`
-      # is the default SigType), so do not record one: such a typedef is an
-      # alias of an object, not of void (e.g. CERT_BLOB = CRYPT_INTEGER_BLOB)
-      var baseIsObject = false
-      while cur.base == bNamed and guard < 16:
-        let j = firstIdx.getOrDefault(cur.name, -1)
-        if j < 0:
-          break
-        if m.types[j].kind in {tkStruct, tkInterface}:
-          baseIsObject = true
-          break
-        cur = m.types[j].underlying
-        inc guard
-      if not baseIsObject:
-        c.typePrims[t.name] = cur.prim
-      if cur.base == bPtr:
-        c.typePtr.incl t.name
-    if t.name notin c.typeKind:
-      c.typeKind[t.name] = t.kind
-
-  # ---- pass 1: sweep every signature reference to collect unknown names --
-  for i in 0 ..< m.types.len:
-    let t = m.types[i]
-    if t.kind == tkHandle or t.kind == tkUnscopedEnum:
-      discard renderType(c, t.underlying)
-    for f in t.fields:
-      discard renderType(c, f.ty)
-    if t.kind == tkDelegate:
-      discard renderType(c, t.ret)
-  for cc in m.consts:
-    discard renderType(c, cc.ty)
-  for f in m.fns:
-    for p in f.params:
-      discard renderType(c, p.ty)
-    discard renderType(c, f.ret)
-
-  var stubList = toSeq(c.unknownTypes)
-  stubList.sort() # stable freshname
-
-  for n in stubList:
-    c.stubNames[n] = c.freshName(fixIdent(n))
+  # ---- naming phase (nameplan.nim) ----------------------------------------
+  # emitted names, stubs, arch variants, suppressed aliases and the
+  # name-level reference data, computed from the Model alone
+  var c = GenCtx(typeHdr: typeHdr)
+  var np = buildNamePlan(m) # TODO make let
 
   # ---- module ownership -----------------------------------------------------
   # module keys: every export DLL (order of first appearance of its
@@ -808,268 +306,67 @@ proc generateCore(
   for i in 0 ..< m.fns.len:
     moduleIdx[fnOwner[i]].add i
 
-  # direct type-name references of every model type, plus which refs
-  # are pointer-shaped (nPtr > 0 or a pointer-alias type): only those
-  # can be rendered opaquely (`pointer`) to sever a dependency edge
-  var typeRefNames: seq[seq[string]] = newSeq[seq[string]](m.types.len)
-  var ptrRefs: Table[string, bool]
-  # the named type at the leaf of a type tree (through pointer/by-ref/array
-  # decorators); "" when the leaf is a primitive
-  proc leafNamed(ty: SigType): string =
-    var cur = ty
-    while cur.base == bPtr or cur.base == bByRef or cur.base == bArray:
-      cur = cur.inner[]
-    if cur.base == bNamed: cur.name else: ""
-
-  # collect the referenced type name from a field/param SigType; the edge is
-  # pointer-shaped (severable) when the field's outermost decoration is a
-  # pointer, or the field is a direct handle alias
-  proc addRefs(i: int, ty: SigType, ownerName: string) =
-    let ln = leafNamed(ty)
-    if ln.len > 0:
-      typeRefNames[i].add ln
-      if ty.base == bPtr or
-          (ty.base == bNamed and c.typeKind.getOrDefault(ty.name, tkStruct) == tkHandle):
-        ptrRefs[ownerName & "/" & ln] = true
-
-  for i in 0 ..< m.types.len:
-    let t = m.types[i]
-    case t.kind
-    of tkStruct:
-      for f in t.fields:
-        addRefs(i, f.ty, t.name)
-    of tkHandle:
-      let ln = leafNamed(t.underlying)
-      if ln.len > 0:
-        typeRefNames[i].add ln
-        # a pointer alias is pointer-shaped: the edge can be severed by
-        # rendering the alias opaquely (`distinct pointer`)
-        ptrRefs[t.name & "/" & ln] = true
-    of tkDelegate:
-      for f in t.fields:
-        addRefs(i, f.ty, t.name)
-      addRefs(i, t.ret, t.name)
-    else:
-      discard
-
-  # zone split: a type that (transitively) references a split name must be
-  # emitted after the selector aliases (Nim resolves identifiers
-  # textually; a type section cannot forward-reference a later section)
-  # while variants must come before the aliases. Names referenced by a
-  # variant that themselves reference split names cannot be laid out —
-  # drop those from splitting (fallback: first row keeps the name, the
-  # rest get the usual _2 suffixes)
-  # zone B = names that (transitively) reference a split name. Computed
-  # by monotone fixed-point coloring: split names are the seeds and the
-  # color propagates backwards along reference edges. Fixed-point
-  # propagation handles reference cycles correctly (the memoized DFS
-  # mis-classified names in cycles such as IRP <-> IRP_4).
-  var zoneB: HashSet[string]
-  var allNames0: seq[string]
-  for (nm, l) in nameRows.pairs:
-    allNames0.add nm
-
-  proc recolor() =
-    zoneB.clear()
-
-    for (nm, l) in splitInfo.pairs:
-      zoneB.incl(nm)
-
-    var changedC = true
-    while changedC:
-      changedC = false
-      for nm in allNames0:
-        if nm in zoneB:
-          continue
-
-        var hit = false
-        for ri in nameRows[nm]:
-          for r in typeRefNames[ri]:
-            if r in zoneB:
-              hit = true
-              break
-          if hit:
-            break
-        if hit:
-          zoneB.incl nm
-          changedC = true
-
-  recolor()
-
-  # a variant may only reference zone A names (or other variants of the
-  # same split names): if a name referenced — directly or transitively —
-  # by a variant row lives in zone B, the layout is impossible and the
-  # name falls back to plain duplicate handling
-  proc unsplit(nm: string) =
-    if nm in splitInfo:
-      splitInfo.del nm
-    for i in 0 ..< m.types.len:
-      if m.types[i].name == nm:
-        if rowVariant[i] >= 0:
-          rowVariant[i] = -1
-          # the per-arch name was consumed in pass 0; reassign with the
-          # usual dedup suffix. The firstIdx row gets the plain name
-          # back: it was reserved for the selector alias, so no other
-          # type can hold it
-          let base0 = m.types[i].nimName
-          var assigned = base0
-          if i != firstIdx[nm]:
-            if nimIdentNormalize(assigned) in c.usedNames:
-              var i2 = 2
-              while nimIdentNormalize(base0 & "_" & $i2) in c.usedNames:
-                inc i2
-              assigned = base0 & "_" & $i2
-          c.usedNames.incl nimIdentNormalize(assigned)
-          typeNames[i] = assigned
-          c.nameMap[nm] = assigned
-          # keep the row-keyed reference map in sync with the reassignment
-          if rowCount.getOrDefault(nm, 0) > 1:
-            c.dupRowEmit[m.types[i].defRow] = assigned
-    recolor()
-
-  var changed = true
-  while changed:
-    changed = false
-    var splitNames2: seq[string]
-    for (nm, l) in splitInfo.pairs:
-      splitNames2.add nm
-    for nm in splitNames2:
-      var bad = false
-      # a reference from a variant row to another split name is only
-      # rewritable if that name has a variant with the same arch set; the
-      # winmd arch sets do not always partition cleanly (IMAGE_RUNTIME_
-      # FUNCTION_ENTRY [i386,amd64] points at _IMAGE_RUNTIME_FUNCTION_
-      # ENTRY [amd64] / [i386,arm64]). When no variant matches, the
-      # reference falls back to the plain name — a forward ref to the
-      # selector alias, which a variant (zone A) cannot make — so the
-      # name must be unsplit.
-      for ri in nameRows.getOrDefault(nm, @[]):
-        let aSet = m.types[ri].arch
-        for r in typeRefNames[ri]:
-          if r in splitInfo:
-            var matched = false
-            for rs in splitInfo[r]:
-              if rs == aSet:
-                matched = true
-            if not matched:
-              bad = true
-              break
-        if bad:
-          break
-      # every name this variant's closure reaches through non-split names
-      # (skipped when the arch-match check already flagged a conflict)
-      var seen: HashSet[string]
-      var stack: seq[string]
-      for ri in nameRows.getOrDefault(nm, @[]):
-        for r in typeRefNames[ri]:
-          if r notin splitInfo and r notin seen:
-            stack.add r
-      while stack.len > 0 and not bad:
-        let r = stack[stack.len - 1]
-        stack.setLen(stack.len - 1)
-        if r in seen or r in splitInfo:
-          continue
-        seen.incl r
-        if r in zoneB:
-          bad = true
-          break
-        let ri = firstIdx.getOrDefault(r, -1)
-        if ri >= 0:
-          for r2 in typeRefNames[ri]:
-            if r2 notin splitInfo and r2 notin seen:
-              stack.add r2
-      if bad:
-        unsplit nm
-        changed = true
+  # ---- arch variants (fns) ----------------------------------------------
+  # A fn name whose duplicate winmd rows each carry a distinct, non-empty
+  # SupportedArchitectureAttribute is a per-arch variant (like the type
+  # rows): the rows are emitted as one `when defined(...)` block with one
+  # declaration per arch set under a shared name. The rows of a split name
+  # must share a module and a DLL (so the block sits inside one dynlib
+  # group); otherwise they fall back to the usual dedup suffix.
+  var fnNameRows: Table[string, seq[int]]
+  for i in 0 ..< m.fns.len:
+    fnNameRows.mGetOrPut(m.fns[i].name).add i
+  var fnSplitFirst: Table[int, seq[int]] # group's first row -> all rows
+  var fnSplitSkip: HashSet[int] # the group's remaining rows
+  for nm in fnNameRows.keys:
+    var rows = fnNameRows[nm]
+    if rows.len < 2:
+      continue
+    var ok = true
+    for i in 0 ..< rows.len:
+      # every row must carry a distinct, non-empty arch set
+      if m.fns[rows[i]].arch.len == 0:
+        ok = false
         break
-
-  # ---- A-suffix alias suppression --------------------------------------------
-  # Runs after the unsplit loop: typeNames / nameMap / dupRowEmit are final.
-  # A handle whose emitted line is a plain alias `X = Y` with X & "A" == Y
-  # exactly is a pure ANSI/Unicode wrapper (STARTUPINFOEX -> STARTUPINFOEXA):
-  # the alias adds nothing, so it is suppressed and every reference to X
-  # resolves to Y's emitted name. Names whose emitted form does not match
-  # exactly (dedup suffixes, fixIdent changes: OFNOTIFY = OFNOTIFYA_2,
-  # TRUSTEE_X = TRUSTEE_A, HW_PROFILE_INFO_2 = HW_PROFILE_INFOA_2) keep
-  # their alias. Only plain aliases qualify: the target must already be a
-  # unique type (an object, a distinct handle, a scoped enum, or a stub —
-  # e.g. LPFINDREPLACE -> LPFINDREPLACEA, a handle aliasing a struct
-  # pointer), so the alias is redundant, and X's name must be single-row
-  # (row-pinned references cannot be redirected).
-  for i in 0 ..< m.types.len:
-    let t = m.types[i]
-
-    if t.kind != tkHandle:
+      for j in i + 1 ..< rows.len:
+        if m.fns[rows[i]].arch == m.fns[rows[j]].arch:
+          ok = false
+          break
+      if not ok:
+        break
+    if ok:
+      # every row must live in one module and one DLL group
+      for i in 1 ..< rows.len:
+        if fnOwner[rows[i]] != fnOwner[rows[0]] or
+            m.fns[rows[i]].moduleName != m.fns[rows[0]].moduleName:
+          ok = false
+          break
+    if not ok:
       continue
-
-    let u = t.underlying
-    if u.base != bNamed:
-      continue
-
-    if rowCount.getOrDefault(t.name, 0) != 1:
-      continue
-
-    # the target's emitted name, as renderLeaf would resolve an unpinned
-    # (or row-pinned) reference to it
-    var target = ""
-    if u.rowIdx >= 0 and u.rowIdx in c.dupRowEmit:
-      target = c.dupRowEmit[u.rowIdx]
-    else:
-      let k = u.ns & "/" & u.name
-      if k in c.nameMap:
-        target = c.nameMap[k]
-      elif u.name in c.nameMap:
-        target = c.nameMap[u.name]
-      else:
-        target = c.stubNames.getOrDefault(u.name, fixIdent(u.name))
-
-    if typeNames[i] & "A" != target:
-      continue
-
-    # only plain aliases: the target must already be a unique type (an
-    # object, a distinct handle, a scoped enum, or a stub), so the alias
-    # is redundant; a shared target (primitive, pointer, void-alias,
-    # unscoped enum) would make `X = distinct Y`, which is not redundant
-    if not isUniqueType(c, u):
-      continue
-
-    c.aAlias[t.name] = u.name # graph redirection (raw names)
-    c.aAliasFinal[t.name] = target # rendered name references resolve to
-    c.nameMap[t.ns & "/" & t.name] = target
-    c.nameMap[t.name] = target
-
-  # the reference graph was collected before the suppression: redirect its
-  # edges (a suppressed name's only reference is its target, so the
-  # transitive closure is unchanged — zone/unsplit decisions already made
-  # above are unaffected)
-  for i in 0 ..< m.types.len:
-    for ri in 0 ..< typeRefNames[i].len:
-      let r = typeRefNames[i][ri]
-      if r in c.aAlias:
-        typeRefNames[i][ri] = c.aAlias[r]
-
-  if c.aAlias.len > 0:
-    var ptrRefs2: Table[string, bool]
-    for (k, v) in ptrRefs.pairs:
-      let slash = k.rfind('/')
-      var k2 = k
-      let refName = k[slash + 1 ..< k.len]
-      if refName in c.aAlias:
-        k2 = k[0 ..< slash] & "/" & c.aAlias[refName]
-      ptrRefs2[k2] = v
-    ptrRefs = ptrRefs2
+    # narrowest arch set first (stable), like the const blocks
+    for i in 1 ..< rows.len:
+      var j = i
+      while j > 0 and m.fns[rows[j]].arch.len < m.fns[rows[j - 1]].arch.len:
+        swap(rows[j], rows[j - 1])
+        dec j
+    var first = rows[0]
+    for r in rows:
+      if r < first:
+        first = r
+    fnSplitFirst[first] = rows
+    for r in rows:
+      if r != first:
+        fnSplitSkip.incl r
 
   # direct type-name references of every const: the declared type plus,
   # for struct-typed consts, the field types
   var constRefs: seq[seq[string]] = newSeq[seq[string]](m.consts.len)
   for ci in 0 ..< m.consts.len:
-    var tn = leafNamed(m.consts[ci].ty)
+    var tn = np.skipAAlias(leafNamed(m.consts[ci].ty))
     if tn.len > 0:
-      if tn in c.aAlias:
-        tn = c.aAlias[tn]
       constRefs[ci].add tn
-      if c.typeKind.hasKey(tn) and c.typeKind[tn] == tkStruct:
-        for f in m.types[firstIdx[tn]].fields:
+      if np.isTypeKind(tn, tkStruct):
+        for f in m.types[np.firstIdx[tn]].fields:
           let fr = leafNamed(f.ty)
           if fr.len > 0:
             constRefs[ci].add fr
@@ -1083,18 +380,15 @@ proc generateCore(
     for p in m.fns[fi].params:
       var pn = leafNamed(p.ty)
       if pn.len > 0:
-        if pn in c.aAlias:
-          pn = c.aAlias[pn]
-        rs.add pn
-    var rn = leafNamed(m.fns[fi].ret)
-    if rn.len > 0:
-      if rn in c.aAlias:
-        rn = c.aAlias[rn]
-      rs.add rn
-    fnRefNames[fi] = rs
+        rs.add np.skipAAlias(pn)
+    block:
+      var rn = leafNamed(m.fns[fi].ret)
+      if rn.len > 0:
+        rs.add np.skipAAlias(rn)
+      fnRefNames[fi] = rs
 
     for r in rs:
-      if r in firstIdx: # only types defined in this winmd
+      if r in np.firstIdx: # only types defined in this winmd
         if r notin referencedBy:
           referencedBy[r] = @[]
         let dn =
@@ -1157,20 +451,19 @@ proc generateCore(
   var clRefs: seq[seq[string]]
   for i in 0 ..< m.types.len:
     # suppressed aliases are not emitted: their references do not exist
-    if m.types[i].name in c.aAlias:
+    if m.types[i].name in np.aAlias:
       continue
     clOwnerKey.add m.types[i].name
-    clRefs.add typeRefNames[i]
+    clRefs.add np.typeRefNames[i]
   for ci in 0 ..< m.consts.len:
-    var tn = m.consts[ci].ty.name
-    if tn.len > 0 and tn in c.aAlias:
-      tn = c.aAlias[tn]
+    let tn = np.skipAAlias(m.consts[ci].ty.name)
+
     if tn.len > 0:
       clOwnerKey.add tn
       var rs: seq[string]
-      if c.typeKind.hasKey(tn) and c.typeKind[tn] == tkStruct:
+      if np.isTypeKind(tn, tkStruct):
         rs.add tn
-        for f in m.types[firstIdx[tn]].fields:
+        for f in m.types[np.firstIdx[tn]].fields:
           if f.ty.name.len > 0:
             rs.add f.ty.name
       clRefs.add rs
@@ -1196,7 +489,7 @@ proc generateCore(
       baseWork.del(baseWork.len - 1)
       for r in clRefs[ki]:
         # a base handle with a module pointee renders opaquely
-        # (`distinct pointer`) and therefore does not reference it
+        # (`pointer`) and therefore does not reference it
         if ki < m.types.len and m.types[ki].kind == tkHandle and
             m.types[ki].name in ownerOf and ownerOf[m.types[ki].name] == "" and
             r == m.types[ki].underlying.name:
@@ -1217,9 +510,8 @@ proc generateCore(
   proc constOwner(cc: ModelConst): string =
     if cc.name in typeHdr:
       return headerOwnerKey(typeHdr[cc.name])
-    var tn = cc.ty.name
-    if tn.len > 0 and tn in c.aAlias:
-      tn = c.aAlias[tn]
+    let tn = np.skipAAlias(cc.ty.name)
+
     if tn.len > 0:
       return ownerOf.getOrDefault(tn, "")
     result = ""
@@ -1237,11 +529,11 @@ proc generateCore(
   # cycle on the referencing side usually base-ifies far fewer types.
   var cycleEdges: seq[CycleEdge]
   proc closureSize(start: string): int =
-    if start notin firstIdx:
+    if start notin np.firstIdx:
       return 0
 
     var seen: HashSet[string]
-    var q: seq[int] = @[firstIdx[start]]
+    var q: seq[int] = @[np.firstIdx[start]]
     seen.incl start
     while q.len > 0:
       let idx = q[q.len - 1]
@@ -1249,20 +541,20 @@ proc generateCore(
       if ownerOf.getOrDefault(m.types[idx].name, "") == "":
         continue
       inc result
-      for r in typeRefNames[idx]:
-        if r in firstIdx and r notin seen:
+      for r in np.typeRefNames[idx]:
+        if r in np.firstIdx and r notin seen:
           seen.incl r
-          q.add firstIdx[r]
+          q.add np.firstIdx[r]
 
   while true:
     var adj: seq[seq[tuple[to: int, refName: string, srcName: string]]] =
       newSeq[seq[tuple[to: int, refName: string, srcName: string]]](moduleOrder.len)
     for i in 0 ..< m.types.len:
       # suppressed aliases are not emitted: no module edge from them
-      if m.types[i].name in c.aAlias:
+      if m.types[i].name in np.aAlias:
         continue
       let o1 = ownerOf[m.types[i].name]
-      for r in typeRefNames[i]:
+      for r in np.typeRefNames[i]:
         let o2 = ownerOf.getOrDefault(r, "")
         # base handles with a module pointee render opaquely: no edge
         if o1 == "" and m.types[i].kind == tkHandle and r == m.types[i].underlying.name and
@@ -1304,11 +596,11 @@ proc generateCore(
       for j in 0 ..< e.pathSrc.len:
         let s = e.pathSrc[j]
         let key = s & "/" & e.pathRef[j]
-        if s.len > 0 and key in ptrRefs and key notin severed:
+        if s.len > 0 and key in np.ptrRefs and key notin severed:
           severed.incl key
           didSever = true
       let key0 = e.srcName & "/" & e.refName
-      if e.srcName.len > 0 and key0 in ptrRefs and key0 notin severed:
+      if e.srcName.len > 0 and key0 in np.ptrRefs and key0 notin severed:
         severed.incl key0
         didSever = true
     if didSever:
@@ -1323,14 +615,14 @@ proc generateCore(
       # alias itself: a struct's reference closure is its fields, while
       # an alias is just its pointee — the pointee's header then keeps
       # the real type and only the alias is rendered opaquely in base
-      if pick in firstIdx and m.types[firstIdx[pick]].kind == tkHandle and
-          m.types[firstIdx[pick]].underlying.name.len > 0:
-        let pt = m.types[firstIdx[pick]].underlying.name
+      if pick in np.firstIdx and m.types[np.firstIdx[pick]].kind == tkHandle and
+          m.types[np.firstIdx[pick]].underlying.name.len > 0:
+        let pt = m.types[np.firstIdx[pick]].underlying.name
         # only while the pointee is still in a module — if it is
         # already base, fall back to base-ifying the alias itself
         # (rendered opaquely), otherwise the loop never converges
-        if pt in firstIdx and ownerOf.getOrDefault(pt, "") != "" and
-            m.types[firstIdx[pt]].kind notin {tkHandle, tkUnscopedEnum}:
+        if pt in np.firstIdx and ownerOf.getOrDefault(pt, "") != "" and
+            m.types[np.firstIdx[pt]].kind notin {tkHandle, tkUnscopedEnum}:
           pick = pt
       if ownerOf.getOrDefault(pick, "") != "":
         ownerOf[pick] = ""
@@ -1351,7 +643,7 @@ proc generateCore(
   # earliest one (moduleOrder) and the rest import it — since a stub
   # references nothing, this cannot create a cycle.
   var stubsByModule: Table[string, seq[string]]
-  for n in c.unknownTypes:
+  for n in np.stubNames.keys:
     var mods: seq[string]
     proc addMod(x: string) =
       if x.len > 0 and not contains(mods, x):
@@ -1362,7 +654,7 @@ proc generateCore(
         if r == n:
           addMod(fnOwner[fi])
     for i in 0 ..< m.types.len:
-      for r in typeRefNames[i]:
+      for r in np.typeRefNames[i]:
         if r == n:
           addMod(ownerOf[m.types[i].name])
     for ci in 0 ..< m.consts.len:
@@ -1380,9 +672,9 @@ proc generateCore(
 
   # group types / constants by owning module
   var typesByModule: Table[string, seq[int]]
-  for idx in order:
+  for idx in np.order:
     # suppressed aliases are not emitted: they do not keep a module alive
-    if m.types[idx].name in c.aAlias:
+    if m.types[idx].name in np.aAlias:
       continue
     let o = ownerOf[m.types[idx].name]
     if o != "":
@@ -1421,12 +713,12 @@ proc generateCore(
 
   for i in 0 ..< m.types.len:
     # suppressed aliases are not emitted: no module dep from them
-    if m.types[i].name in c.aAlias:
+    if m.types[i].name in np.aAlias:
       continue
     let o1 = ownerOf[m.types[i].name]
     if o1 == "":
       continue
-    for r in typeRefNames[i]:
+    for r in np.typeRefNames[i]:
       let o2 = ownerOf.getOrDefault(r, "")
       if o2 != "" and (m.types[i].name & "/" & r) notin severed:
         addDep(o1, o2)
@@ -1450,7 +742,7 @@ proc generateCore(
 
   # ---- header ---------------------------------------------------------------
   c.text.add "# generated by winmd2nim from Windows.Win32.winmd — do not edit\n"
-  c.text.add "# types=" & $(c.knownTypes.len) & " fns=" & $m.fns.len & " consts=" &
+  c.text.add "# types=" & $(np.knownTypes.len) & " fns=" & $m.fns.len & " consts=" &
     $m.consts.len & "\n\n"
 
   # ---- types -------------------------------------------------------------------
@@ -1475,15 +767,15 @@ proc generateCore(
       inc nPtr
       leaf = leaf.inner[]
     if variantCtx.len > 0 and nPtr <= 2 and leaf.base == bNamed and
-        leaf.name in splitInfo:
+        leaf.name in np.splitInfo:
       var matched = -1
-      let sets = splitInfo[leaf.name]
+      let sets = np.splitInfo[leaf.name]
       for i in 0 ..< sets.len:
         if sets[i] == variantCtx:
           matched = i
           break
       if matched >= 0:
-        let v = variantOut[leaf.name][matched]
+        let v = np.variantOut[leaf.name][matched]
         if nPtr == 0:
           v
         elif nPtr == 1:
@@ -1491,42 +783,38 @@ proc generateCore(
         else:
           "ptr ptr " & v
       else:
-        renderType(c, t)
+        np.renderType(t)
     else:
-      renderType(c, t)
+      np.renderType(t)
 
   proc emitType(c: var GenCtx, m: Model, i: int, name: string) =
     let t = m.types[i]
     case t.kind
     of tkStruct:
-      if t.fields.len == 0:
-        c.line "  " & name & "* = object"
-      else:
-        # layout comes from the winmd type attributes (the Rust reference
-        # uses the same): ExplicitLayout (0x10) means the fields are
-        # overlaid — a C union — so emit {.union.}; a ClassLayout packing
-        # emits {.packed.}.
-        # TODO AlignmentAttribute is read into alignSize but
-        #     not emitted)
-        var pragmas: seq[string] = @["completeStruct"]
-        if t.isUnion:
-          pragmas.add "union"
-        if t.packSize > 0:
-          pragmas.add "packed"
-        pragmas.add c.headerPragma(t.name)
+      # layout comes from the winmd type attributes (the Rust reference
+      # uses the same): ExplicitLayout (0x10) means the fields are
+      # overlaid — a C union — so emit {.union.}; a ClassLayout packing
+      # emits {.packed.}.
+      # TODO AlignmentAttribute is read into alignSize but
+      #     not emitted)
+      var pragmas: seq[string] = @["mdtype"]
+      if t.isUnion:
+        pragmas.add "union"
+      if t.packSize > 0:
+        pragmas.add "packed"
 
-        let pragma = renderPragma(pragmas)
-        c.line "  " & name & "*" & pragma & " = object"
-        var fUsed: HashSet[string]
-        for f in t.fields:
-          let
-            fn = fUsed.freshIdent(f.nimName)
-            fldRef = leafNamed(f.ty)
+      let pragma = renderPragma(pragmas)
+      c.line "  " & name & "*" & pragma & " = object"
+      var fUsed: HashSet[string]
+      for f in t.fields:
+        let
+          fn = fUsed.freshIdent(f.nimName)
+          fldRef = leafNamed(f.ty)
 
-          if fldRef.len > 0 and (t.name & "/" & fldRef) in severed:
-            c.line "    " & esc(fn) & "*: pointer"
-          else:
-            c.line "    " & esc(fn) & "*: " & renderRef(f.ty)
+        if fldRef.len > 0 and (t.name & "/" & fldRef) in severed:
+          c.line "    " & esc(fn) & "*: pointer"
+        else:
+          c.line "    " & esc(fn) & "*: " & renderRef(f.ty)
     of tkHandle:
       # curated string-pointer aliases (README: the LPSTR/PSTR family
       # maps to the idiomatic Nim string pointer types — same ABI)
@@ -1545,38 +833,28 @@ proc generateCore(
 
       # base handles with a module pointee, or a pointee edge that the
       # cycle resolver severed: render opaquely
-      let undRef = leafNamed(t.underlying)
       # the graph keys use the redirected name for suppressed aliases
-      var undRefG = undRef
-      if undRefG.len > 0 and undRefG in c.aAlias:
-        undRefG = c.aAlias[undRefG]
+      let undRefG = np.skipAAlias(leafNamed(t.underlying))
       let isSevered = undRefG.len > 0 and (t.name & "/" & undRefG) in severed
       if isSevered:
         base = "pointer #[" & base & "]#"
 
-      # a base that is already a unique type (an object, a distinct handle,
-      # a scoped enum, or a pointer to one) keeps its identity without
-      # `distinct`; a shared base (primitive, pointer, void-alias, unscoped
-      # enum) needs `distinct` to stay a separate type. A void-alias handle
-      # is a plain `void` alias, and a severed pointee renders opaquely as
-      # `pointer` (shared)
-      let hp = c.headerBlock(t.name)
-      if isSevered or (not isUniqueType(c, t.underlying) and base != "void"):
-        c.line "  " & name & "*" & hp & " = distinct " & base
-      else:
-        c.line "  " & name & "*" & hp & " = " & base
+      # a plain alias: a void-alias handle is a plain `void` alias, and a
+      # severed pointee renders opaquely as `pointer`
+      let hp = " {.mdalias.}"
+      c.line "  " & name & "*" & hp & " = " & base
     of tkEnum:
-      c.line "  " & name & "*" & c.headerBlock(t.name) & " = enum"
+      c.line "  " & name & "* {.mdalias.} = enum"
       for f in t.fields:
         if f.hasConstant:
-          let member = esc(c.freshName(f.nimName))
+          let member = esc(np.freshName(f.nimName))
           c.line "    " & member & " = " & $f.constant
     of tkUnscopedEnum:
-      let base = renderType(c, t.underlying)
-      c.line "  " & name & "*" & c.headerBlock(t.name) & " = " & base
+      let base = np.renderType(t.underlying)
+      c.line "  " & name & "* {.mdalias.} = " & base
     of tkDelegate:
       if t.fields.len == 0:
-        c.line "  " & name & "* = pointer"
+        c.line "  " & name & "* {.mdalias.} = pointer"
       else:
         var s = "proc ("
         var pUsed: HashSet[string]
@@ -1587,30 +865,26 @@ proc generateCore(
             pn = pused.freshIdent(t.fields[k].nimName)
             ft = t.fields[k].ty
 
-          var ftRef = leafNamed(ft)
           # the graph keys use the redirected name for suppressed aliases
-          if ftRef.len > 0 and ftRef in c.aAlias:
-            ftRef = c.aAlias[ftRef]
+          let ftRef = np.skipAAlias(leafNamed(ft))
           if ftRef.len > 0 and (t.name & "/" & ftRef) in severed:
             s.add esc(pn) & ": ptr pointer"
           else:
             s.add esc(pn) & ": " & renderRef(ft)
-        var retRef = leafNamed(t.ret)
-        if retRef.len > 0 and retRef in c.aAlias:
-          retRef = c.aAlias[retRef]
+        let retRef = np.skipAAlias(leafNamed(t.ret))
         if retRef.len > 0 and (t.name & "/" & retRef) in severed:
           s.add "): pointer"
         else:
           s.add "): " & renderRef(t.ret)
-        c.line "  " & name & "*" & c.headerBlock(t.name) & " = " & s & " {.stdcall.}"
+        c.line "  " & name & "* {.mdalias.} = " & s & " {.stdcall.}"
     of tkInterface:
-      c.line "  " & name & "*" & c.headerBlock(t.name) & " = distinct object"
+      c.line "  " & name & "* {.mdinterface.} = object"
 
   var kindSeen = false
   proc emitKind(kind: TypeKind, idxList: seq[int], label: string) =
     var has = false
     for idx in idxList:
-      if m.types[idx].kind == kind and m.types[idx].name notin c.aAlias:
+      if m.types[idx].kind == kind and m.types[idx].name notin np.aAlias:
         has = true
         break
 
@@ -1621,12 +895,12 @@ proc generateCore(
       c.line ""
     c.line "  # " & label
     for idx in idxList:
-      if m.types[idx].kind == kind and m.types[idx].name notin c.aAlias:
-        if rowVariant[idx] >= 0:
-          variantCtx = splitInfo[m.types[idx].name][rowVariant[idx]]
+      if m.types[idx].kind == kind and m.types[idx].name notin np.aAlias:
+        if np.rowVariant[idx] >= 0:
+          variantCtx = np.splitInfo[m.types[idx].name][np.rowVariant[idx]]
         else:
           variantCtx = {}
-        emitType(c, m, idx, esc(typeNames[idx]))
+        emitType(c, m, idx, esc(np.typeNames[idx]))
         variantCtx = {}
     kindSeen = true
 
@@ -1634,7 +908,7 @@ proc generateCore(
     emitKind(tkStruct, idxList, "structs")
     emitKind(tkHandle, idxList, "typdefs")
     emitKind(tkEnum, idxList, "scoped enums")
-    emitKind(tkUnscopedEnum, idxList, "unscoped enums ")
+    emitKind(tkUnscopedEnum, idxList, "unscoped enums")
     emitKind(tkDelegate, idxList, "delegates")
     emitKind(tkInterface, idxList, "interfaces")
 
@@ -1644,7 +918,7 @@ proc generateCore(
   proc emitAliasBlocks(nameSet: seq[string]) =
     for n in nameSet:
       var conds: seq[set[Architecture]]
-      for a in splitInfo[n]:
+      for a in np.splitInfo[n]:
         var found = false
         for b in conds:
           if a == b:
@@ -1657,21 +931,20 @@ proc generateCore(
         let hdr = if bi == 0: "when " else: "elif "
         let cond = archCond(a)
         c.line hdr & cond & ":"
-        for vi in 0 ..< splitInfo[n].len:
-          if a == splitInfo[n][vi]:
-            c.line "  type " & esc(m.types[nameRows[n][0]].nimName) & "* = " &
-              variantOut[n][vi]
+        for vi in 0 ..< np.splitInfo[n].len:
+          if a == np.splitInfo[n][vi]:
+            c.line "  type " & esc(m.types[np.nameRows[n][0]].nimName) & "* = " &
+              np.variantOut[n][vi]
             break
         inc bi
       c.line "else:"
-      c.line "  type " & esc(m.types[nameRows[n][0]].nimName) & "* = " & variantOut[n][
-        0
-      ]
+      c.line "  type " & esc(m.types[np.nameRows[n][0]].nimName) & "* = " &
+        np.variantOut[n][0]
 
   var baseTypeIdxs: seq[int]
-  for idx in order:
+  for idx in np.order:
     # suppressed aliases are not emitted: they do not keep the base alive
-    if m.types[idx].name in c.aAlias:
+    if m.types[idx].name in np.aAlias:
       continue
     if ownerOf[m.types[idx].name] == "":
       baseTypeIdxs.add idx
@@ -1682,7 +955,7 @@ proc generateCore(
     let nm = m.types[idx].name
     # split names always zone A: their rows are the per-arch variants,
     # which must precede the selector aliases
-    if nm notin splitInfo and nm in zoneB:
+    if nm notin np.splitInfo and nm in np.zoneB:
       baseB.add idx
     else:
       baseA.add idx
@@ -1690,7 +963,7 @@ proc generateCore(
   var baseSplitNames: seq[string]
   var seenSplit: Table[string, bool]
   var baseSplitList: seq[string]
-  for (n, l) in splitInfo.pairs:
+  for (n, l) in np.splitInfo.pairs:
     baseSplitList.add n
 
   for n in baseSplitList:
@@ -1699,7 +972,7 @@ proc generateCore(
       seenSplit[n] = true
 
   c.line "type"
-  if c.guidUsed:
+  if np.guidUsed:
     # System.Guid is a TypeRef to mscorlib in this winmd (no TypeDef):
     # emit the 16-byte C GUID layout so by-value fields keep the ABI
     c.line "  # System.Guid (TypeRef to mscorlib): 16-byte C GUID layout"
@@ -1711,7 +984,8 @@ proc generateCore(
     c.line ""
 
   emitKinds(baseA)
-  c.line ""
+  if kindSeen:
+    c.line ""
   emitAliasBlocks(baseSplitNames)
   if baseSplitNames.len > 0:
     c.line ""
@@ -1721,6 +995,11 @@ proc generateCore(
     c.line ""
 
   # ---- constants -------------------------------------------------------------
+  ## Sort rank of a const row: narrowest arch set first (untagged rows
+  ## would sort last; no emitted `when` group contains any).
+  proc rowArchRank(cc: ModelConst): int =
+    if cc.arch.len == 0: 99 else: cc.arch.len
+
   ## True when the const rows of this name are emitted as a standalone
   ## `when` block (a `const` section cannot contain `when` statements).
   proc constIsWhen(ci: int): bool =
@@ -1762,7 +1041,7 @@ proc generateCore(
           break
       if sameVal:
         ci2 = group[0]
-    renderedIsPtr(c, m.consts[ci2].ty)
+    renderedIsPtr(np, m.consts[ci2].ty)
 
   ## Emits one const; returns true when it emitted a standalone block
   ## (a `when` or a pointer-cast `template`, which ends the surrounding
@@ -1792,7 +1071,7 @@ proc generateCore(
         return # the group's const was already emitted
       constGroupEmitted[cc.name] = true
 
-    let name = esc(c.freshName(cc.nimName))
+    let name = esc(np.freshName(cc.nimName)) # TODO fix freshName usage
 
     # wide (utf-16) string constants: not translated for now — a comment
     # with the name, the value and a TODO
@@ -1808,16 +1087,16 @@ proc generateCore(
       let cc2 = m.consts[ci2]
       var et = cc2.ty
       # constants on handle typedefs carry pvVoid; recover the base kind
-      if cc2.ty.name.len > 0 and cc2.ty.name in c.typePrims:
-        et.prim = c.typePrims[cc2.ty.name]
+      if cc2.ty.name.len > 0 and cc2.ty.name in np.typePrims:
+        et.prim = np.typePrims[cc2.ty.name]
       var tyS =
         if cc2.isStr:
           "string"
         else:
-          renderType(c, et)
+          np.renderType(et)
       var val = renderConstValue(et, cc2)
       var isCast = false
-      let isPtrTy = renderedIsPtr(c, cc2.ty)
+      let isPtrTy = renderedIsPtr(np, cc2.ty)
       if not cc2.isStr and cc2.value == 0 and isPtrTy:
         val = "nil"
       elif not cc2.isStr and cc2.value != 0 and isPtrTy:
@@ -1826,12 +1105,10 @@ proc generateCore(
 
       # struct-typed constants (e.g. DEVPKEY_*: only the trailing propId is
       # in the metadata): emit a struct literal with defaults + last field
-      if not cc2.isStr and cc2.ty.name.len > 0 and
-          c.typeKind.getOrDefault(cc2.ty.name, tkStruct) == tkStruct and
-          cc2.ty.name in c.typeKind and c.typeKind[cc2.ty.name] == tkStruct:
-        var stype = m.types[firstIdx[cc2.ty.name]]
+      if not cc2.isStr and cc2.ty.name.len > 0 and np.isTypeKind(cc2.ty.name, tkStruct):
+        var stype = m.types[np.firstIdx[cc2.ty.name]]
         if stype.fields.len > 0:
-          var init = esc(typeNames[firstIdx[cc2.ty.name]]) & "("
+          var init = esc(np.typeNames[np.firstIdx[cc2.ty.name]]) & "("
           for k in 0 ..< stype.fields.len:
             if k > 0:
               init.add ", "
@@ -1839,27 +1116,25 @@ proc generateCore(
             init.add esc(f.nimName) & ": "
             if k == stype.fields.len - 1:
               var uty = f.ty
-              if uty.name.len > 0 and uty.name in c.typePrims:
-                uty.prim = c.typePrims[uty.name]
+              if uty.name.len > 0 and uty.name in np.typePrims:
+                uty.prim = np.typePrims[uty.name]
               var lit = renderIntConst(uty.prim, cc2.value)
-              # distinct base types need an explicit conversion
-              if f.ty.base == bNamed and
-                  c.typeKind.getOrDefault(f.ty.name, tkStruct) == tkHandle and
-                  c.typeKind.hasKey(f.ty.name):
+              # unique base types need an explicit conversion
+              if f.ty.base == bNamed and np.isTypeKind(f.ty.name, tkHandle):
                 let tn2 =
-                  if f.ty.name in c.aAlias:
-                    c.aAliasFinal[f.ty.name]
+                  if f.ty.name in np.aAlias:
+                    np.aAliasFinal[f.ty.name]
                   else:
                     fixIdent(f.ty.name)
                 lit = esc(tn2) & "(" & lit & ")"
               init.add lit
             else:
-              init.add defaultLit(c, m, firstIdx, f.ty)
+              init.add defaultLit(np, m, f.ty)
           init.add ")"
           val = init
 
       # unsigned constant whose target type is signed (e.g. HRESULT =
-      # distinct int32): render the wrapped two's-complement value
+      # int32): render the wrapped two's-complement value
       if not cc2.isStr and tyS != "uint32":
         if et.prim == pvI4 and cc2.value > 2147483647 and tyS != "uint32":
           val = $(cast[int32](cc2.value)) & "'i32"
@@ -1871,10 +1146,9 @@ proc generateCore(
       # this compiler never converts implicitly to distinct types:
       # wrap the literal in an explicit conversion (a value that is
       # already an explicit cast is left as-is)
-      if not cc2.isStr and cc2.ty.name.len > 0 and c.typeKind.hasKey(cc2.ty.name) and
-          c.typeKind[cc2.ty.name] == tkHandle and tyS != "uint32" and
+      if not cc2.isStr and cc2.ty.name.len > 0 and np.isTypeKind(cc2.ty.name, tkHandle) and tyS != "uint32" and
           not val.startsWith("cast["):
-        let tname = esc(c.nameMap.getOrDefault(cc2.ty.name, fixIdent(cc2.ty.name)))
+        let tname = esc(np.nameMap.getOrDefault(cc2.ty.name, fixIdent(cc2.ty.name)))
         val = tname & "(" & val & ")"
       result = (tyS, val, isCast)
 
@@ -1932,10 +1206,10 @@ proc generateCore(
 
   proc emitMembers(enumIdx: int) =
     let t = m.types[enumIdx]
-    let baseName = esc(typeNames[enumIdx])
+    let baseName = esc(np.typeNames[enumIdx])
     for f in t.fields:
       if f.hasConstant:
-        let member = esc(c.freshName(f.nimName))
+        let member = esc(np.freshName(f.nimName))
         c.line "  " & member & "*: " & baseName & " = " &
           renderIntConst(t.underlying.prim, f.constant)
 
@@ -1999,7 +1273,7 @@ proc generateCore(
   # so this is normally empty)
   var baseEmitted =
     baseTypeIdxs.len > 0 or baseSplitNames.len > 0 or baseConstIdxs.len > 0 or
-    baseMemberIdxs.len > 0 or c.guidUsed
+    baseMemberIdxs.len > 0 or np.guidUsed
 
   # ---- functions + per-module assembly ---------------------------------------
   # header-only modules can end up empty after base-closure / cycle
@@ -2010,6 +1284,46 @@ proc generateCore(
     emitted[dn] =
       moduleIdx[dn].len > 0 or dn in typesByModule or dn in constsByModule or
       dn in membersByModule or dn in stubsByModule
+
+  # module key -> the module's defining header stem ("" for pure DLL
+  # modules): a header module is keyed by its own stem; a header stem
+  # that sanitizes to an existing DLL module name merges into that
+  # module (the stem is recorded on the DLL key). The recorded stem is
+  # the parent (the module key for header modules, the DLL's stem for
+  # merged ones), never a numbered variant (winbase_1.h does not exist
+  # in the SDK)
+  var dllKeys: HashSet[string]
+  for i in 0 ..< m.fns.len:
+    let dn =
+      if m.fns[i].moduleName.len > 0:
+        m.fns[i].moduleName
+      else:
+        "misc"
+    dllKeys.incl dn
+
+  var moduleHeader: Table[string, string]
+  for k in 0 ..< moduleOrder.len:
+    let dn = moduleOrder[k]
+    if dn in dllKeys:
+      # merged module: a mapped header stem that sanitizes to this
+      # DLL's name (the DLL's stem is itself a mapped header)
+      if dllNames[k] in hdrStems:
+        moduleHeader[dn] = dllNames[k]
+    else:
+      # pure header module: keyed by its own stem
+      moduleHeader[dn] = dn
+
+  # the header to include for a module's mdheader pragma: the module's
+  # header stem, unless the stem cannot be included directly
+  # (noDirectInclude), in which case headerIncludeOverride names the
+  # replacement ("" = no mdheader definition at all)
+  var moduleHeaderFinal: Table[string, string]
+  for (k, h) in moduleHeader.pairs:
+    if h in noDirectInclude:
+      moduleHeaderFinal[k] = headerIncludeOverride(h)
+    else:
+      moduleHeaderFinal[k] = h
+
   result.mods = @[]
   for k in 0 ..< moduleOrder.len:
     let dn = moduleOrder[k]
@@ -2037,12 +1351,81 @@ proc generateCore(
       t.add "export " & deps & "\n"
     t.add "\n"
 
+    # the module's functions grouped per export DLL (a header module's
+    # functions may span several DLLs); sorted by DLL, then by name, so
+    # each DLL sits in one contiguous block. The dynlib name is
+    # lowercased with the .dll suffix stripped (Nim resolves the
+    # dynlib name per target OS); other extensions (.drv, .cpl) are kept
+    var fns: seq[tuple[dl, name: string, idx: int]]
+    for i in moduleIdx[dn]:
+      let f = m.fns[i]
+      var dl = if f.moduleName.len > 0: f.moduleName else: "misc"
+      dl = dl.toLowerAscii()
+      if dl.endsWith(".dll"):
+        dl.setLen(dl.len - 4)
+      fns.add (dl, f.name, i)
+    fns.sort
+
+    # file-level pragmas: mdmethod bundles the pragmas shared by all of
+    # the module's functions (sideEffect); mdtype covers the structs
+    # (objects, incl. the opaque stubs), mdalias the aliases
+    # (handles, enums, unscoped enums, delegates) and mdinterface the
+    # interfaces.
+    #
+    # With --headers, when the module has a resolvable defining header, a
+    # `when defined(checkAbi) or defined(mdheaders):` block defines
+    # mdheader (the module's `header: "stem.h"`, active only in
+    # checkAbi / mdheaders builds) and mdmethod / mdtype / mdalias /
+    # mdinterface include it. The dynlib stays a per-group push/pop (a
+    # single header module may span several export DLLs)
+    let mh = moduleHeaderFinal.getOrDefault(dn, "")
+    let useHeader = emitHeaders and mh.len > 0
+    var hasStruct = dn in stubsByModule
+    var hasAlias = false
+    var hasInterface = false
+    for idx in typesByModule.getOrDefault(dn, @[]):
+      case m.types[idx].kind
+      of tkStruct:
+        hasStruct = true
+      of tkHandle, tkEnum, tkUnscopedEnum, tkDelegate:
+        hasAlias = true
+      of tkInterface:
+        hasInterface = true
+
+    if useHeader:
+      t.add "when defined(checkAbi) or defined(mdheaders):\n"
+      t.add "  {.pragma: mdheader, header: \"" & mh & ".h\".}\n"
+      t.add "else:\n"
+      t.add "  {.pragma: mdheader.}\n"
+    if fns.len > 0:
+      var p = @["sideEffect"]
+      if useHeader:
+        p.add "mdheader"
+      t.add "{.pragma: mdmethod, " & p.join(", ") & ".}\n"
+    if hasStruct:
+      if useHeader:
+        t.add "{.pragma: mdtype, pure, inheritable, completeStruct, mdheader.}\n"
+      else:
+        t.add "{.pragma: mdtype, pure, inheritable, completeStruct.}\n"
+    if hasAlias:
+      if useHeader:
+        t.add "{.pragma: mdalias, mdheader.}\n"
+      else:
+        t.add "{.pragma: mdalias.}\n"
+    if hasInterface:
+      if useHeader:
+        t.add "{.pragma: mdinterface, mdheader.}\n"
+      else:
+        t.add "{.pragma: mdinterface.}\n"
+    if useHeader or fns.len > 0 or hasStruct or hasAlias or hasInterface:
+      t.add "\n"
+
     if dn in stubsByModule:
       t.add "type\n\n"
       t.add "  # opaque stubs: referenced in signatures, not defined in this winmd\n"
       for n in stubsByModule[dn]:
-        let name = esc(c.stubNames[n])
-        t.add "  " & name & "* = distinct object\n"
+        let name = esc(np.stubNames[n])
+        t.add "  " & name & "* {.mdtype.} = object\n"
       t.add "\n"
 
     if dn in typesByModule:
@@ -2051,7 +1434,7 @@ proc generateCore(
       var mB: seq[int]
       for idx in typesByModule[dn]:
         let nm = m.types[idx].name
-        if nm notin splitInfo and nm in zoneB:
+        if nm notin np.splitInfo and nm in np.zoneB:
           mB.add idx
         else:
           mA.add idx
@@ -2060,7 +1443,7 @@ proc generateCore(
       var seenS: HashSet[string]
       for idx in typesByModule[dn]:
         let n = m.types[idx].name
-        if n in splitInfo and n notin seenS:
+        if n in np.splitInfo and n notin seenS:
           mSplit.add n
           seenS.incl n
 
@@ -2114,23 +1497,48 @@ proc generateCore(
       t.add c.text[l0 ..< c.text.len]
       c.text.setLen(l0)
 
-    if moduleIdx[dn].len > 0:
-      # procs are grouped per export DLL (a header module's functions
-      # may span several DLLs); the DLL module has exactly one group.
-      # Sort by DLL, then by name, so each DLL appears in one
-      # contiguous block and gets a single push/pop pair
-      var fns: seq[tuple[dl, name: string, idx: int]]
-      for i in moduleIdx[dn]:
-        let f = m.fns[i]
-        var dl = if f.moduleName.len > 0: f.moduleName else: "misc"
-        # Nim resolves the dynlib name per target OS: lowercase and
-        # strip the .dll suffix (user32, not USER32.dll); other
-        # extensions (.drv, .cpl) are kept
-        dl = dl.toLowerAscii()
-        if dl.len > 4 and dl[dl.len - 4 .. dl.high] == ".dll":
-          dl.setLen(dl.len - 4)
-        fns.add (dl, f.name, i)
-      fns.sort
+    if fns.len > 0:
+      # the --lowercase option: Nim convention is that proc names
+      # start with a lowercase letter; the importc pragma keeps the
+      # real linkage name. The normalized (case-insensitive) name is
+      # unchanged, so no new collisions are introduced
+      proc freshFnName(f: ModelFn): string =
+        result = np.freshName(f.nimName) # TODO fix freshName
+        if lowerFirst and result.len > 0 and result[0] in {'A' .. 'Z'}:
+          result[0] = result[0].toLowerAscii()
+
+      # one fn row's declaration under the given (unescaped) name
+      proc renderFnDecl(f: ModelFn, fn: string): string =
+        let name = esc(fn)
+        var s = "proc " & name & "*("
+        var pUsed: HashSet[string]
+        for pi in 0 ..< f.params.len:
+          if pi > 0:
+            s.add ", "
+
+          let pn = pUsed.freshIdent(f.params[pi].nimName)
+
+          s.add esc(pn) & ": " & np.renderType(f.params[pi].ty)
+        s.add ")"
+        let ret = np.renderType(f.ret)
+        if ret != "void":
+          s.add ": " & ret
+        # Not all windows functions have side effects but we have no way of
+        # knowing (or do we?) — mdmethod carries the shared sideEffect
+        # pragma (and mdheader with --headers); when the emitted name
+        # is exactly the C name, bare `importc` suffices (it imports
+        # under the symbol's own name)
+
+        var pragmas = @["mdmethod"]
+        if fn == f.importName:
+          pragmas.add "importc"
+        else:
+          pragmas.add "importc: \"" & f.importName & "\""
+
+        if f.stdcall:
+          pragmas.add "stdcall"
+
+        result = s & renderPragma(pragmas) & "\n"
 
       var curDll = ""
       for e in fns:
@@ -2141,47 +1549,21 @@ proc generateCore(
             t.add "{.pop.}\n"
           t.add "{.push dynlib: \"" & dl & "\".}\n"
           curDll = dl
-        var fn = c.freshName(f.nimName)
-
-        # the --lowercase option: Nim convention is that proc names
-        # start with a lowercase letter; the importc pragma keeps the
-        # real linkage name. The normalized (case-insensitive) name is
-        # unchanged, so no new collisions are introduced
-        if c.lowerFirst and fn.len > 0 and fn[0] in {'A' .. 'Z'}:
-          fn[0] = fn[0].toLowerAscii()
-
-        let name = esc(fn)
-        var s = "proc " & name & "*("
-        var pUsed: HashSet[string]
-        for pi in 0 ..< f.params.len:
-          if pi > 0:
-            s.add ", "
-
-          let pn = pUsed.freshIdent(f.params[pi].nimName)
-
-          s.add esc(pn) & ": " & renderType(c, f.params[pi].ty)
-        s.add ")"
-        let ret = renderType(c, f.ret)
-        if ret != "void":
-          s.add ": " & ret
-        # Not all windows functions have side effects but we have no way of
-        # knowing (or do we?)
-        # when the emitted name is exactly the C name, bare `importc`
-        # suffices (it imports under the symbol's own name)
-
-        var pragmas = @["sideEffect"]
-        if fn == f.importName:
-          pragmas.add "importc"
-        else:
-          pragmas.add "importc: \"" & f.importName & "\""
-
-        if f.stdcall:
-          pragmas.add "stdcall"
-
-        pragmas.add c.headerPragma(f.name)
-
-        s.add renderPragma(pragmas) & "\n"
-        t.add s
+        if e.idx in fnSplitSkip:
+          continue
+        let rows = fnSplitFirst.getOrDefault(e.idx, @[])
+        if rows.len > 0:
+          # arch-split group: one declaration per arch set under a
+          # shared name (like the arch-tagged const blocks); every
+          # branch has an explicit arch condition, so on archs no row
+          # covers the fn is simply not declared
+          let fn = freshFnName(f)
+          for ri in 0 ..< rows.len:
+            let r = m.fns[rows[ri]]
+            t.add (if ri == 0: "when " else: "elif ") & archCond(r.arch) & ":\n"
+            t.add "  " & renderFnDecl(r, fn)
+          continue
+        t.add renderFnDecl(f, freshFnName(f))
       t.add "{.pop.}\n"
     var fm: FnModule
     fm.dll = dn

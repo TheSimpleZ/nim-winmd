@@ -35,7 +35,8 @@ ensureCgen STARTUPINFOA
 ensureCgen PROCESS_INFORMATION
 
 # the FFI surface works under wine: call a real API (the desktop window
-# handle is non-nil; HWND is a distinct pointer, so compare via its base)
+# handle is non-nil; HWND is a plain alias of pointer, so compare via its
+# base)
 doAssert cast[pointer](GetDesktopWindow()) != nil
 
 echo "checkAbi: all 10 types verified against the mingw headers"

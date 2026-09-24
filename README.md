@@ -75,9 +75,9 @@ The repository has nimble tasks (`nimble tasks`):
 * `nimble checkabi` — ABI-check the generated bindings against the
   mingw-w64 Windows headers (cross-compiled from Linux, run under wine)
 * `nimble win32abi` — regenerate the bindings into `../nim-win32-abi`
-  (writing a `SOURCE.env` with git provenance tags); extra `winmd2nim`
-  flags (e.g. `--headers --lowercase`) go in the `WINMDFLAGS`
-  environment variable
+  (writing a `SOURCE.env` with git provenance tags); the bindings are
+  generated with `--headers` by default, and extra `winmd2nim` flags
+  (e.g. `--lowercase`) go in the `WINMDFLAGS` environment variable
 
 The tests and the tools use the `windows-rs` git submodule at the repo
 root (the winmd and the per-header RDL snapshot); the `winmd2nim` /
@@ -97,17 +97,18 @@ depending on whether a symbol map was used (either as a text file or rdl).
 Unlike the Windows SDK, ECMA-335 declares most ABI functions using plain
 primitive types - `uint32` instead of `DWORD`.
 
-Where the `.winmd` file makes the information available, more specific,
-distinct types may be used. `COLORREF` for example is a `distinct uint32` in
-this mapping, even though it's part of the base types.
+Where the `.winmd` file makes the information available, more specific
+type names may be used as plain aliases. `COLORREF` for example is a plain
+alias of `uint32`.
 
-With the `--headers` option, every type and function whose defining header
-is known from the RDL/provenance map gets a `header: "<header>.h"` pragma:
-the compiler then treats it as declared in that C header (no C declaration
-is emitted). Constants get no pragma — `header` implies `nodecl`, so the C
-code would reference a symbol the named header need not declare. Compiling
-such a build with `-d:checkAbi` verifies the generated layouts against the
-real Windows headers — see `tests/checkabi.nim` and `nimble checkabi`.
+Types, methods and aliases are marked by `mdtype`, `mdmethod`, `mdalias` and
+`mdinterface` pragmas.
+
+With the `--headers` option, an addition `mdheader` pragma is add - when the
+program is compiled with `-d:checkAbi` or `-d:mdheaders`, `mdheader` is expanded
+to a `{.header.}` pragma that causes Nim to use the declaration from the header
+instead of its own. This mode is useful for verifying that the generator
+agrees on the ABI with the C compiler - see also the `checkAbi` task.
 
 * [Windows data types](https://learn.microsoft.com/en-us/windows/win32/winprog/windows-data-types)
 * [ECMA-335 types](https://github.com/stakx/ecma-335/blob/master/docs/ii.23.1.16-element-types-used-in-signatures.md)
@@ -140,15 +141,24 @@ As an exception to the general rule of avoiding hand-curation, `LPSTR`, `PSTR`
 variants (`LPWSTR`, `PWSTR`, ...) as `ptr UncheckedArray[uint16]` — same
 ABI, no import required.
 
-### Functions
+### Methods
 
-Function names are kept as-is by default (exactly the C name), in which case
-the `importc` pragma is bare. With the `--lowercase` option, the initial
-letter is lowercased to adhere to Nim standards and avoid trivial conflicts
-with types due to the lax identifier equivalence rules in Nim; the `importc`
-pragma then spells the real linkage name.
+Methods in the metadata are mapped to `proc` in Nim.
+
+Method names are kept as-is by default (exactly the C name).
+
+With the `--lowercase` option, the initial letter is lowercased to adhere to Nim
+standards and avoid trivial conflicts with types due to the lax identifier
+equivalence rules in Nim; the `importc` pragma then spells the real linkage name.
 
 Where conflicts still happen, names get numbered suffixes.
+
+### Interfaces
+
+COM interfaces (`IUnknown` etc) are generated as opaque types (`object`)
+and are always passed by pointer in the C ABI.
+
+VTables are currently not generated (TODO).
 
 ## Resources
 

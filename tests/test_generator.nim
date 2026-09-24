@@ -2,7 +2,7 @@
 #
 # Two layers:
 #   1. synthetic models — exact rendering of small hand-built Models
-#      (escaping, collision suffixing, cstring, distinct handles, unknown
+#      (escaping, collision suffixing, cstring, plain handle aliases, unknown
 #      stubs, header provenance, determinism)
 #   2. the full Windows.Win32 model — structural assertions on the
 #      generated source (CreateWindowExW surface, 14567 importc lines,
@@ -50,7 +50,7 @@ m.types.add ModelType(
     ModelField(name: "y", nimName: fixIdent("y"), ty: prim(pvI4)),
   ],
 )
-# HID's underlying is ptr void -> must render as `distinct pointer`
+# HID's underlying is ptr void -> must render as `pointer`
 var hidBase: SigType
 hidBase.base = bPtr
 hidBase.inner = new(SigType)
@@ -100,7 +100,7 @@ m.types.add ModelType(
   hasUnderlying: true,
 )
 # a handle whose pointee is a pointer-alias handle (like LPSC_HANDLE):
-# must render `distinct ptr <name>`, not `distinct pointer`
+# must render `ptr <name>`, not `pointer`
 var lpPtrAliasBase: SigType
 lpPtrAliasBase.base = bPtr
 lpPtrAliasBase.inner = new(SigType)
@@ -272,6 +272,58 @@ m.fns.add ModelFn(
   ret: named("System2", "Mystery"),
   params: @[ModelParam(name: "p", nimName: fixIdent("p"), ty: addrParam)],
 )
+# arch-split fn: two same-name rows, each with a distinct
+# SupportedArchitectureAttribute (like GetQueuedCompletionStatus:
+# lpCompletionKey is ptr uint64 on 64-bit, ptr uint32 on i386). Must be
+# emitted as one `when defined(...)` block with one declaration per arch
+# set under a shared name (narrowest arch set first), not a `_2` suffix
+m.fns.add ModelFn(
+  name: "ArchFn",
+  nimName: fixIdent("ArchFn"),
+  importName: "ArchFn",
+  moduleName: "M.dll",
+  arch: {amd64, arm64},
+  ret: prim(pvVoid),
+  params: @[ModelParam(name: "k", nimName: fixIdent("k"), ty: prim(pvU8))],
+)
+m.fns.add ModelFn(
+  name: "ArchFn",
+  nimName: fixIdent("ArchFn"),
+  importName: "ArchFn",
+  moduleName: "M.dll",
+  arch: {i386},
+  ret: prim(pvVoid),
+  params: @[ModelParam(name: "k", nimName: fixIdent("k"), ty: prim(pvU4))],
+)
+# a fn taking an interface by-value (the winmd encodes the `This` param
+# by-value): it must render as a pointer (COM interfaces are always passed
+# by pointer — see unknwnbase.h: `IUnknown *This`)
+m.fns.add ModelFn(
+  name: "TakeThing",
+  nimName: fixIdent("TakeThing"),
+  importName: "TakeThing",
+  moduleName: "M.dll",
+  ret: prim(pvVoid),
+  params: @[ModelParam(name: "t", nimName: fixIdent("t"), ty: named("NS", "IThing"))],
+)
+# a fn taking a pointer-to-interface (the winmd encodes it as `ptr
+# IThing`, the C `IUnknown **` — e.g. SHGetInstanceExplorer(IUnknown
+# **ppunk)): the interface pointee is itself a pointer, so it renders as
+# `ptr ptr IThing` (a double pointer)
+var iThingPtrParam: SigType
+iThingPtrParam.base = bPtr
+iThingPtrParam.inner = new(SigType)
+iThingPtrParam.inner[].base = bNamed
+iThingPtrParam.inner[].ns = "NS"
+iThingPtrParam.inner[].name = "IThing"
+m.fns.add ModelFn(
+  name: "TakeThingPtr",
+  nimName: fixIdent("TakeThingPtr"),
+  importName: "TakeThingPtr",
+  moduleName: "M.dll",
+  ret: prim(pvVoid),
+  params: @[ModelParam(name: "t", nimName: fixIdent("t"), ty: iThingPtrParam)],
+)
 m.fns.add ModelFn(
   name: "TakeHid",
   nimName: fixIdent("TakeHid"),
@@ -418,7 +470,7 @@ for n in @[
 ]:
   typeHdr[n] = "hd"
 
-let smods = generateModules(m, typeHdr)
+let smods = generateModules(m, typeHdr, false)
 doAssert smods[0].name == "win32base"
 let sbase = smods[0].code
 var hdmod = ""
@@ -436,51 +488,62 @@ for gm in smods:
     smod.add gm.code
 doAssert smod.len > 0
 
+# without --headers: the file-level mdmethod / mdtype / mdalias
+# pragmas bundle the shared pragmas (sideEffect for fns); structs and
+# stubs use mdtype, aliases use mdalias, fns use mdmethod. No
+# header / checkAbi pragmas are emitted or used.
+doAssert "{.pragma: mdmethod, sideEffect.}" in hdmod
+doAssert "{.pragma: mdtype, pure, inheritable, completeStruct.}" in hdmod
+doAssert "{.pragma: mdalias.}" in hdmod
+doAssert "{.pragma: mdinterface.}" in hdmod
+doAssert "when defined(checkAbi)" notin hdmod
+doAssert "mdheader" notin hdmod
+doAssert "{.header:" notin hdmod
 # types live in the module of their defining header: hd
-doAssert "POINT* {.completeStruct.} = object" in hdmod
+doAssert "POINT* {.mdtype.} = object" in hdmod
 doAssert "x*: int32" in hdmod
-doAssert "E* = enum" in hdmod
+doAssert "E* {.mdalias.} = enum" in hdmod
 doAssert "  a = 0" in hdmod
 doAssert "  b = 1" in hdmod
 # duplicate member "a" in E2 -> suffixed
 doAssert "a_2 = 7" in hdmod
 # unscoped enum: alias in the hd module + member const
-doAssert "U* = uint32" in hdmod
+doAssert "U* {.mdalias.} = uint32" in hdmod
 doAssert "u1*: U = 0x5'u32" in hdmod
-doAssert "IThing* = distinct object" in hdmod
+doAssert "IThing* {.mdinterface.} = object" in hdmod
 # fixed-size array field -> `array[<len>, <elem>]` (length first in this build)
-doAssert "BUF* {.completeStruct.} = object" in hdmod
+doAssert "BUF* {.mdtype.} = object" in hdmod
 doAssert "data*: array[4, uint8]" in hdmod
-doAssert "HID* = distinct pointer" in hdmod
-# a void-alias typedef renders as a plain `void` alias (not `distinct`);
-# a handle whose pointee is a void-alias renders `distinct <name>`
-doAssert "VOIDALIAS* = void" in hdmod
-doAssert "VOIDALIAS2* = distinct VOIDALIAS" in hdmod
-# a pointer-alias typedef renders `distinct pointer`; a handle whose
-# pointee is a pointer-alias stays `distinct ptr <name>` (not collapsed)
-doAssert "PTRALIAS* = distinct pointer" in hdmod
-# a `ptr` of an already-distinct type is itself distinct, so no `distinct`
-doAssert "LPPTRALIAS* = ptr PTRALIAS" in hdmod
+doAssert "HID* {.mdalias.} = pointer" in hdmod
+# a void-alias typedef renders as a plain `void` alias; a handle whose
+# pointee is a void-alias renders a plain alias of the name
+doAssert "VOIDALIAS* {.mdalias.} = void" in hdmod
+doAssert "VOIDALIAS2* {.mdalias.} = VOIDALIAS" in hdmod
+# a pointer-alias typedef renders `pointer`; a handle whose pointee is a
+# pointer-alias stays `ptr <name>` (not collapsed)
+doAssert "PTRALIAS* {.mdalias.} = pointer" in hdmod
+# a `ptr` of an already-unique type is itself unique, so no `distinct`
+doAssert "LPPTRALIAS* {.mdalias.} = ptr PTRALIAS" in hdmod
 doAssert "LPPTRALIAS* = distinct ptr PTRALIAS" notin hdmod
 doAssert "LPPTRALIAS* = distinct pointer" notin hdmod
 # a struct-alias typedef renders as a plain alias of the struct; a `ptr`
 # field of it stays `ptr <name>` (not collapsed to `pointer`)
-doAssert "BLOBALIAS* = BLOB" in hdmod
+doAssert "BLOBALIAS* {.mdalias.} = BLOB" in hdmod
 doAssert "BLOBALIAS* = distinct BLOB" notin hdmod
 doAssert "BLOBALIAS* = void" notin hdmod
 doAssert "p*: ptr BLOBALIAS" in hdmod
 doAssert "p*: pointer" notin hdmod
 # a plain `A` alias of another typedef (handle) is suppressed (like the
 # struct A-aliases): only the A-suffixed target is emitted
-doAssert "LPFINDREPLACEA* = ptr FINDREPLACEA" in hdmod
+doAssert "LPFINDREPLACEA* {.mdalias.} = ptr FINDREPLACEA" in hdmod
 doAssert "LPFINDREPLACE*" notin hdmod
-doAssert "CB* = proc (arg_1: HID): int32 {.stdcall.}" in hdmod
-doAssert "NOINV* = pointer" in hdmod
-# unknown type referenced by an M.dll fn -> opaque stub in that fn's
-# module (not the base, not the type header)
-doAssert "Mystery* = distinct object" notin sbase
-doAssert "Mystery* = distinct object" in smod
-doAssert "Mystery* = distinct object" notin hdmod
+doAssert "CB* {.mdalias.} = proc (arg_1: HID): int32 {.stdcall.}" in hdmod
+doAssert "NOINV* {.mdalias.} = pointer" in hdmod
+# unknown type referenced by an M.dll fn -> opaque stub (mdtype) in
+# that fn's module (not the base, not the type header)
+doAssert "Mystery* {.mdtype.} = object" notin sbase
+doAssert "Mystery* {.mdtype.} = object" in smod
+doAssert "Mystery* {.mdtype.} = object" notin hdmod
 # unmapped primitive-typed constants -> base
 doAssert "C*: int32 = 260" in sbase
 doAssert "C_2*: int32 = 1" in sbase
@@ -494,7 +557,7 @@ doAssert "template PCONST*: untyped = cast[PTRALIAS](3)" in hdmod
 doAssert "PCONST*: PTRALIAS = cast[PTRALIAS](3)" notin hdmod
 doAssert "PCONST*: uint32" notin hdmod
 doAssert "template NEGPCONST*: untyped = cast[PTRALIAS](-3)" in hdmod
-doAssert "POINT* {.completeStruct.} = object" notin sbase
+doAssert "POINT* {.mdtype.} = object" notin sbase
 doAssert "S*: string = \"say \\\"hi\\\"\"" in sbase
 
 # unmapped functions live in the m module, which imports only the type
@@ -503,12 +566,19 @@ doAssert "import ./[win32base, hd]" in mmod
 doAssert "export win32base, hd" in mmod
 # keyword name: keywords are reserved in usedNames, so the Nim name is
 # renamed (addr_2) while the import name stays `addr`
-doAssert "proc addr_2*(p: ptr char): Mystery {.sideEffect, importc: \"addr\".}" in mmod
+doAssert "proc addr_2*(p: ptr char): Mystery {.mdmethod, importc: \"addr\".}" in mmod
 doAssert "p: ptr char" in mmod
+# arch-split fn: one `when` block, one declaration per arch set under a
+# shared name (narrowest arch set first), no `_2` suffix
+doAssert "when defined(i386):" in mmod
+doAssert "  proc ArchFn*(k: uint32) {.mdmethod, importc.}" in mmod
+doAssert "elif defined(amd64) or defined(arm64):" in mmod
+doAssert "  proc ArchFn*(k: uint64) {.mdmethod, importc.}" in mmod
+doAssert "ArchFn_2" notin mmod
 # by default function names are kept as-is (exactly the C name), so
 # bare `importc` suffices
 doAssert "proc TakeHid*(h: HID, cb: CB)" in mmod
-doAssert "{.sideEffect, importc.}" in mmod
+doAssert "{.mdmethod, importc.}" in mmod
 # `ptr` of a void-alias typedef (direct and via a handle chain) renders
 # as the bare `pointer` — Nim forbids `ptr void`
 doAssert "proc TakeVoidAlias*(p: pointer, q: pointer)" in mmod
@@ -522,17 +592,31 @@ doAssert "proc TakePtrAlias*(p: pointer)" notin mmod
 # fn signature (the alias itself is not emitted)
 doAssert "proc TakeFindReplace*(p: LPFINDREPLACEA)" in mmod
 doAssert "LPFINDREPLACE)" notin mmod
-# the dynlib name is lowercased and the .dll suffix stripped
+# interface refs: a by-value interface (the `This` param) gets the missing
+# `ptr` (a single pointer); a pointer-to-interface (the C `IUnknown **`)
+# renders as a double pointer (`ptr ptr IThing`)
+doAssert "proc TakeThing*(t: ptr IThing)" in mmod
+doAssert "proc TakeThingPtr*(t: ptr ptr IThing)" in mmod
+# the dynlib name is lowercased and the .dll suffix stripped; the dynlib
+# stays a per-group push/pop (even for a single-DLL module)
 doAssert "{.push dynlib: \"m\".}" in mmod
 doAssert "{.pop.}" in mmod
+doAssert "mdheader" notin mmod
+# the m module has no aliases or interfaces: mdalias / mdinterface
+# are not defined
+doAssert "mdalias" notin mmod
+doAssert "mdinterface" notin mmod
 # function with header provenance lives in the hd module with its own
 # top-level dynlib statement; the DLL module keeps only the unmapped fns
-doAssert "proc HdFn*() {.sideEffect, importc.}" in hdmod
+doAssert "proc HdFn*() {.mdmethod, importc.}" in hdmod
 doAssert "{.push dynlib: \"m\".}" in hdmod
 doAssert "proc HdFn*" notin mmod
 doAssert "proc TakeHid*" notin hdmod
 
-# --headers option: symbols with known provenance get a header pragma
+# with --headers: the header modules define mdheader (the module's
+# `header: "stem.h"`, active only in checkAbi / mdheaders builds) and
+# mdmethod / mdtype / mdalias include it; the base and the DLL
+# modules (no defining header) get no mdheader at all
 let shmods = generateModules(m, typeHdr, true)
 var shdmod = ""
 var shmmod = ""
@@ -544,21 +628,31 @@ for gm in shmods:
     shmmod = gm.code
   else:
     discard
-doAssert "POINT* {.completeStruct, header: \"hd.h\".} = object" in shdmod
-doAssert "HID* {.header: \"hd.h\".} = distinct pointer" in shdmod
-doAssert "E* {.header: \"hd.h\".} = enum" in shdmod
-doAssert "U* {.header: \"hd.h\".} = uint32" in shdmod
-doAssert "CB* {.header: \"hd.h\".} = proc (arg_1: HID): int32 {.stdcall.}" in shdmod
-doAssert "IThing* {.header: \"hd.h\".} = distinct object" in shdmod
-# constants do not get the header pragma (header implies nodecl)
+# no per-symbol header pragma (the file-level mdheader definition
+# carries the header, not the individual symbols)
+doAssert "{.header:" notin shdmod
+doAssert "when defined(checkAbi) or defined(mdheaders):" in shdmod
+doAssert "  {.pragma: mdheader, header: \"hd.h\".}" in shdmod
+doAssert "else:" in shdmod
+doAssert "  {.pragma: mdheader.}" in shdmod
+doAssert "{.pragma: mdmethod, sideEffect, mdheader.}" in shdmod
+doAssert "{.pragma: mdtype, pure, inheritable, completeStruct, mdheader.}" in shdmod
+doAssert "{.pragma: mdalias, mdheader.}" in shdmod
+doAssert "{.pragma: mdinterface, mdheader.}" in shdmod
+# symbols still use the file-level pragmas (mdtype / mdalias /
+# mdinterface),
+# which expand to mdheader in checkAbi builds — not a bare header
+doAssert "POINT* {.mdtype.} = object" in shdmod
+doAssert "HID* {.mdalias.} = pointer" in shdmod
+# constants do not use the header pragma (header implies nodecl)
 doAssert "u1*: U = 0x5'u32" in shdmod
-# functions: the header pragma joins the importc pragma list
-doAssert "proc HdFn*() {.sideEffect, importc, header: \"hd.h\".}" in shdmod
-# unmapped symbols keep their plain form (base module, dll module)
+# the base module and the DLL module have no defining header: no
+# mdheader at all (the DLL module's pragmas stay header-free)
 doAssert "C*: int32 = 260" in shmods[0].code
-doAssert "header:" notin shmods[0].code
+doAssert "mdheader" notin shmods[0].code
 doAssert "proc TakeHid*(h: HID, cb: CB)" in shmmod
-doAssert "header:" notin shmmod
+doAssert "mdheader" notin shmmod
+doAssert "when defined(checkAbi)" notin shmmod
 
 # --lowercase option: the first letter is lowercased and the importc
 # pragma spells the real linkage name (the emitted name differs)
@@ -568,11 +662,11 @@ for gm in lmods:
   if gm.name == "m":
     lmod = gm.code
 doAssert "proc takeHid*(h: HID, cb: CB)" in lmod
-doAssert "{.sideEffect, importc: \"TakeHid\".}" in lmod
-doAssert "proc addr_2*(p: ptr char): Mystery {.sideEffect, importc: \"addr\".}" in lmod
+doAssert "{.mdmethod, importc: \"TakeHid\".}" in lmod
+doAssert "proc addr_2*(p: ptr char): Mystery {.mdmethod, importc: \"addr\".}" in lmod
 
 # determinism
-let smods2 = generateModules(m, typeHdr)
+let smods2 = generateModules(m, typeHdr, false)
 var ssame = smods.len == smods2.len
 if ssame:
   for j in 0 ..< smods.len:
@@ -597,7 +691,7 @@ const rdl = "windows-rs/metadata"
 typeHdr = rdlmap.readRdlMap(@[rdl])
 doAssert typeHdr.len > 100000, "type header map missing or truncated"
 
-let mods = generateModules(full, typeHdr)
+let mods = generateModules(full, typeHdr, false)
 doAssert mods.len > 600, "expected hundreds of header/dll modules, got " & $mods.len
 
 var winuser: GenModule
@@ -613,6 +707,8 @@ var cryptxmlmod: GenModule
 var wincryptmod: GenModule
 var commdlgmod: GenModule
 var msiquerymod: GenModule
+var unknwnbasemod: GenModule
+var ioapisetmod: GenModule
 var totalFns = 0
 var hasWin32base = false
 for gm in mods:
@@ -645,6 +741,10 @@ for gm in mods:
     commdlgmod = gm
   of "msiquery":
     msiquerymod = gm
+  of "unknwnbase":
+    unknwnbasemod = gm
+  of "ioapiset":
+    ioapisetmod = gm
   else:
     discard
   var j = 0
@@ -667,15 +767,15 @@ doAssert winsvcmod.code.len > 0
 doAssert totalFns == 14567, "expected 14567 importc lines, got " & $totalFns
 
 # header provenance: AASHELLMENUFILENAME lives in shlobj
-doAssert "AASHELLMENUFILENAME* {.completeStruct.} = object" in shlobj.code
-doAssert "LPAASHELLMENUFILENAME* = ptr AASHELLMENUFILENAME" in shlobj.code
+doAssert "AASHELLMENUFILENAME* {.mdtype.} = object" in shlobj.code
+doAssert "LPAASHELLMENUFILENAME* {.mdalias.} = ptr AASHELLMENUFILENAME" in shlobj.code
 # HFILE and MAX_PATH live in minwindef
-doAssert "HFILE* = distinct int32" in minwindefmod.code
+doAssert "HFILE* {.mdalias.} = int32" in minwindefmod.code
 doAssert "MAX_PATH*: int32 = 260" in minwindefmod.code
 # header provenance: the common handles live with their defining headers
-doAssert "POINT* {.completeStruct.} = object" in windefmod.code
-doAssert "HWND* = distinct pointer" in windefmod.code
-doAssert "HINSTANCE* = distinct pointer" in minwindefmod.code
+doAssert "POINT* {.mdtype.} = object" in windefmod.code
+doAssert "HWND* {.mdalias.} = pointer" in windefmod.code
+doAssert "HINSTANCE* {.mdalias.} = pointer" in minwindefmod.code
 # functions live in their defining header, not the DLL module:
 # CreateWindowExW: 12 params, stdcall, USER32.dll; the emitted name is
 # exactly the C name, so the importc pragma is bare
@@ -683,35 +783,44 @@ doAssert "dynlib: \"user32\"" in winuser.code
 let cw = winuser.code.find("proc CreateWindowExW*(")
 doAssert cw >= 0
 let cwline = winuser.code[cw ..< winuser.code.find("\n", cw)]
-doAssert cwline.endswith(": HWND {.sideEffect, importc, stdcall.}"), cwline
+doAssert cwline.endswith(": HWND {.mdmethod, importc, stdcall.}"), cwline
 doAssert "lpParam: pointer" in winuser.code
 doAssert "hInstance: HINSTANCE" in winuser.code
 # MENUTEMPLATEA is a typedef for void: a fn taking `ptr MENUTEMPLATEA`
 # must render the param as the bare `pointer` (Nim forbids `ptr void`)
-doAssert "MENUTEMPLATEA* = void" in winuser.code
+doAssert "MENUTEMPLATEA* {.mdalias.} = void" in winuser.code
 doAssert "proc LoadMenuIndirectA*(lpMenuTemplate: pointer): HMENU" in winuser.code
 doAssert "proc LoadMenuIndirectW*(lpMenuTemplate: pointer): HMENU" in winuser.code
 doAssert "ptr MENUTEMPLATEA" notin winuser.code
 doAssert "ptr MENUTEMPLATEW" notin winuser.code
 # SC_HANDLE is a typedef for pointer (ptr void): a `ptr SC_HANDLE`
-# (LPSC_HANDLE) must stay `distinct ptr SC_HANDLE` (= `ptr pointer`),
-# NOT be collapsed to `distinct pointer`
-doAssert "SC_HANDLE* = distinct pointer" in winsvcmod.code
-# a `ptr` of an already-distinct type is itself distinct, so no `distinct`
-doAssert "LPSC_HANDLE* = ptr SC_HANDLE" in winsvcmod.code
+# (LPSC_HANDLE) must stay `ptr SC_HANDLE` (= `ptr pointer`), NOT be
+# collapsed to `pointer`
+doAssert "SC_HANDLE* {.mdalias.} = pointer" in winsvcmod.code
+# a `ptr` of an already-unique type is itself unique, so no `distinct`
+doAssert "LPSC_HANDLE* {.mdalias.} = ptr SC_HANDLE" in winsvcmod.code
 doAssert "LPSC_HANDLE* = distinct ptr SC_HANDLE" notin winsvcmod.code
 doAssert "LPSC_HANDLE* = distinct pointer" notin winsvcmod.code
 # CERT_BLOB is a typedef for a struct (CRYPT_INTEGER_BLOB): a `ptr
 # CERT_BLOB` field must stay `ptr CERT_BLOB`, not be collapsed to
 # `pointer` (the struct is already a distinct, non-void type)
-doAssert "CERT_BLOB* = CRYPT_INTEGER_BLOB" in wincryptmod.code
+doAssert "CERT_BLOB* {.mdalias.} = CRYPT_INTEGER_BLOB" in wincryptmod.code
 doAssert "rgCertificate*: ptr CERT_BLOB" in cryptxmlmod.code
 doAssert "rgCertificate*: pointer" notin cryptxmlmod.code
 # LPFINDREPLACE is a plain `A` alias of the typedef LPFINDREPLACEA (a
 # handle, not a struct): like the struct A-aliases it is suppressed, and
 # only the A-suffixed target is emitted
-doAssert "LPFINDREPLACEA* = ptr FINDREPLACEA" in commdlgmod.code
+doAssert "LPFINDREPLACEA* {.mdalias.} = ptr FINDREPLACEA" in commdlgmod.code
 doAssert "LPFINDREPLACE*" notin commdlgmod.code
+# GetQueuedCompletionStatus has two winmd rows with distinct arch tags
+# (lpCompletionKey is ptr uint64 on 64-bit, ptr uint32 on i386): one
+# name under a `when defined(...)` block (narrowest arch set first), not
+# two declarations with a `_2` suffix
+doAssert "when defined(i386):" in ioapisetmod.code
+doAssert "  proc GetQueuedCompletionStatus*(CompletionPort: HANDLE, lpNumberOfBytesTransferred: ptr uint32, lpCompletionKey: ptr uint32, lpOverlapped: ptr LPOVERLAPPED, dwMilliseconds: uint32): BOOL {.mdmethod, importc, stdcall.}" in ioapisetmod.code
+doAssert "elif defined(amd64) or defined(arm64):" in ioapisetmod.code
+doAssert "  proc GetQueuedCompletionStatus*(CompletionPort: HANDLE, lpNumberOfBytesTransferred: ptr uint32, lpCompletionKey: ptr uint64, lpOverlapped: ptr LPOVERLAPPED, dwMilliseconds: uint32): BOOL {.mdmethod, importc, stdcall.}" in ioapisetmod.code
+doAssert "GetQueuedCompletionStatus_2" notin ioapisetmod.code
 # MSIDBOPEN_* are integers stored in a pointer-typed (LPCTSTR) constant:
 # the declared type is kept and the value is cast explicitly; the VM
 # cannot evaluate a cast to a pointer type at compile time, so the
@@ -723,8 +832,18 @@ doAssert "MSIDBOPEN_READONLY*: LPCTSTR = LPCTSTR(nil)" in msiquerymod.code
 # GetProcAddress lives in libloaderapi (its defining header)
 doAssert "proc GetProcAddress*" in libloaderapi.code
 doAssert "proc GetProcAddress*" notin winuser.code
+# the IUnknown methods take the interface by pointer (the C ABI is
+# `IUnknown *This` — see unknwnbase.h); the winmd encodes the `This`
+# param by-value, so the missing `ptr` must be added
+doAssert "IUnknown* {.mdinterface.} = object" in unknwnbasemod.code
+doAssert "{.pragma: mdinterface.}" in unknwnbasemod.code
+doAssert "proc IUnknown_AddRef_Proxy*(This: ptr IUnknown): uint32" in unknwnbasemod.code
+doAssert "proc IUnknown_Release_Proxy*(This: ptr IUnknown): uint32" in unknwnbasemod.code
+doAssert "proc IUnknown_QueryInterface_Proxy*(This: ptr IUnknown, riid: ptr GUID, ppvObject: ptr pointer): HRESULT" in
+  unknwnbasemod.code
+doAssert "This: IUnknown" notin unknwnbasemod.code
 # GetLastError lives in its defining header (sti per the provenance map)
-doAssert "proc GetLastError*(): uint32 {.sideEffect, importc, stdcall.}" in stimod.code
+doAssert "proc GetLastError*(): uint32 {.mdmethod, importc, stdcall.}" in stimod.code
 # curated string-pointer aliases (README: LPSTR/PSTR family)
 doAssert "PSTR* = cstring" in winntmod.code
 doAssert "PCSTR* = cstring" in winntmod.code
@@ -742,7 +861,14 @@ doAssert exp >= 0 and "windef" in winuser.code[exp .. winuser.code.find('\n', ex
 # minimal imports: shlobj needs shtypes (PWSTR/COLORREF) but not kernel32
 doAssert "shtypes" in importList(shlobj.code)
 doAssert "kernel32" notin importList(shlobj.code)
-doAssert winuser.code.find("{.pop.}") > 0
+# the dynlib stays a per-group push/pop for every module (a single
+# header module may span several export DLLs): winuser has one user32
+# group, winbase several
+doAssert "{.push dynlib: \"user32\".}" in winuser.code
+doAssert winuser.code.find("{.pop.}") >= 0
+doAssert "{.pragma: mdmethod, sideEffect.}" in winuser.code
+doAssert "when defined(checkAbi)" notin winuser.code
+doAssert "mdheader" notin winuser.code
 
 # dll modules have at most two type sections (zone A before the arch
 # selector aliases, zone B after them), no `import *` anywhere
@@ -760,14 +886,42 @@ for gm in mods:
     j = k + 1
   doAssert ntype <= 2, gm.name & " has " & $ntype & " type sections"
 
-# --headers option on the real model: provenance attaches the real header
-let hdrMods = generateModules(full, typeHdr, true)
-var windefHdr: GenModule
-for gm in hdrMods:
-  if gm.name == "windef":
-    windefHdr = gm
-doAssert "POINT* {.completeStruct, header: \"windef.h\".} = object" in windefHdr.code
-doAssert "HWND* {.header: \"windef.h\".} = distinct pointer" in windefHdr.code
+# with --headers: the header modules define mdheader (the module's
+# `header: "stem.h"`, active in checkAbi / mdheaders builds) and
+# mdmethod / mdtype / mdalias include it; no per-symbol header
+# pragma
+let hmods = generateModules(full, typeHdr, true)
+var hwindef: GenModule
+var hwinnt: GenModule
+var hwinuser: GenModule
+for gm in hmods:
+  case gm.name
+  of "windef":
+    hwindef = gm
+  of "winnt":
+    hwinnt = gm
+  of "winuser":
+    hwinuser = gm
+  else:
+    discard
+# windef has no functions: mdtype / mdalias include mdheader,
+# but mdmethod is not defined (there are no fns to bundle)
+doAssert "{.header:" notin hwindef.code
+doAssert "when defined(checkAbi) or defined(mdheaders):" in hwindef.code
+doAssert "  {.pragma: mdheader, header: \"windef.h\".}" in hwindef.code
+doAssert "  {.pragma: mdheader.}" in hwindef.code
+doAssert "mdmethod" notin hwindef.code
+doAssert "{.pragma: mdtype, pure, inheritable, completeStruct, mdheader.}" in hwindef.code
+doAssert "{.pragma: mdalias, mdheader.}" in hwindef.code
+doAssert "POINT* {.mdtype.} = object" in hwindef.code
+# winuser has functions: mdmethod also includes mdheader
+doAssert "{.pragma: mdmethod, sideEffect, mdheader.}" in hwinuser.code
+doAssert "when defined(checkAbi) or defined(mdheaders):" in hwinuser.code
+doAssert "  {.pragma: mdheader, header: \"winuser.h\".}" in hwinuser.code
+# winnt.h cannot be included directly in the C file: the override
+# includes windef.h instead (noDirectInclude / headerIncludeOverride)
+doAssert "winnt.h" notin hwinnt.code
+doAssert "  {.pragma: mdheader, header: \"minwindef.h\".}" in hwinnt.code
 
 # no duplicate top-level proc names across all modules
 var procNames: Table[system.string, int] = initTable[system.string, int]()
@@ -780,7 +934,7 @@ for nm in procNames.keys:
   doAssert procNames[nm] == 1, "duplicate proc name: " & nm
 
 # determinism
-let mods2 = generateModules(full, typeHdr)
+let mods2 = generateModules(full, typeHdr, false)
 var same = mods.len == mods2.len
 if same:
   for j in 0 ..< mods2.len:
@@ -796,14 +950,14 @@ doAssert same, "generateModules must be deterministic"
 # selector alias, each row matched to its arch by its own attribute — no
 # RDL tree is needed, the arch info comes from the winmd itself.
 block archTest:
-  let archMods = generateModules(full, typeHdr)
+  let archMods = generateModules(full, typeHdr, false)
   var ntddk: GenModule
   for gm in archMods:
     if gm.name == "ntddk":
       ntddk = gm
-  doAssert "KEXCEPTION_FRAME_ARM64* {.completeStruct.} = object" in ntddk.code,
+  doAssert "KEXCEPTION_FRAME_ARM64* {.mdtype.} = object" in ntddk.code,
     "arm64 variant of KEXCEPTION_FRAME missing"
-  doAssert "KEXCEPTION_FRAME_AMD64* {.completeStruct.} = object" in ntddk.code,
+  doAssert "KEXCEPTION_FRAME_AMD64* {.mdtype.} = object" in ntddk.code,
     "amd64 variant of KEXCEPTION_FRAME missing"
   doAssert "defined(arm64)" in ntddk.code
   doAssert "defined(amd64)" in ntddk.code
@@ -811,8 +965,8 @@ block archTest:
   doAssert "type KEXCEPTION_FRAME* = KEXCEPTION_FRAME_" in ntddk.code
   # the arm64 variant has the X0..X28 registers, the amd64 one the R*
   # / Xmm registers — the per-row attribute must not swap them
-  var armIdx = ntddk.code.find("KEXCEPTION_FRAME_ARM64* {.completeStruct.} = object")
-  var amdIdx = ntddk.code.find("KEXCEPTION_FRAME_AMD64* {.completeStruct.} = object")
+  var armIdx = ntddk.code.find("KEXCEPTION_FRAME_ARM64* {.mdtype.} = object")
+  var amdIdx = ntddk.code.find("KEXCEPTION_FRAME_AMD64* {.mdtype.} = object")
   doAssert armIdx >= 0 and amdIdx >= 0
   let armBody = ntddk.code[armIdx ..< armIdx + 400]
   let amdBody = ntddk.code[amdIdx ..< amdIdx + 400]

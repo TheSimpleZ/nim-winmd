@@ -31,7 +31,9 @@ createDir(Path(OUT))
 
 let flags = getenv("WINMDFLAGS")
 
-if execCmd("./winmd2nim " & flags & " " & WINMD & " " & OUT & " " & RDL) != 0:
+# --headers is the default for the generated bindings (the mdheader /
+# checkAbi machinery); WINMDFLAGS can add further flags (e.g. --lowercase)
+if execCmd("./winmd2nim --headers " & flags & " " & WINMD & " " & OUT & " " & RDL) != 0:
   quit 1
 
 writeFile(

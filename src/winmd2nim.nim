@@ -4,13 +4,20 @@
 # Usage:
 #   winmd2nim.nim [--headers] [--lowercase] <input.winmd> <outdir> [type=header map file | rdl dir]
 #
-# --headers: attach a `header: "<stem>.h"` pragma to every type and
-#   function whose defining header is known from the RDL/map provenance.
-#   The compiler then treats it as declared in that C header (no C
-#   declaration is emitted), so a cross-compiled build with -d:checkAbi
-#   (mingw on Linux) can verify the generated layouts against the real
-#   Windows headers — see tests/checkabi.nim. Constants get no pragma
-#   (header implies nodecl).
+# --headers: with this option, a `when defined(checkAbi) or
+# defined(mdheaders):` block defines `{.pragma: mdheader,
+# header: "<stem>.h".}` (empty in the else branch) for the module's
+# defining header, and mdmethod / mdtype / mdalias / mdinterface
+# include mdheader.
+#
+# The header pragma makes the compiler treat the symbol as
+# declared in that C header (no C declaration is emitted), so a
+# build with -d:checkAbi can verify the generated layouts against the real
+# Windows headers — see tests/checkabi.nim.
+
+# A header that cannot be included directly in the C file (e.g. winnt.h) is
+# replaced by another (windef.h) or gets no mdheader at all.
+# Without --headers, no header / checkAbi pragmas are emitted or used.
 #
 # --lowercase: lowercase the first letter of function names (Nim
 #   convention); the importc pragma keeps the real linkage name. When
