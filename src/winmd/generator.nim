@@ -1403,10 +1403,12 @@ proc generateCore(
         p.add "mdheader"
       t.add "{.pragma: mdmethod, " & p.join(", ") & ".}\n"
     if hasStruct:
+      # bycopy: an inheritable object parameter is otherwise passed by
+      # pointer, even to importc procs taking the struct by value
       if useHeader:
-        t.add "{.pragma: mdtype, pure, inheritable, completeStruct, mdheader.}\n"
+        t.add "{.pragma: mdtype, pure, inheritable, bycopy, completeStruct, mdheader.}\n"
       else:
-        t.add "{.pragma: mdtype, pure, inheritable, completeStruct.}\n"
+        t.add "{.pragma: mdtype, pure, inheritable, bycopy, completeStruct.}\n"
     if hasAlias:
       if useHeader:
         t.add "{.pragma: mdalias, mdheader.}\n"

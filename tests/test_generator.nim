@@ -493,7 +493,7 @@ doAssert smod.len > 0
 # stubs use mdtype, aliases use mdalias, fns use mdmethod. No
 # header / checkAbi pragmas are emitted or used.
 doAssert "{.pragma: mdmethod, sideEffect.}" in hdmod
-doAssert "{.pragma: mdtype, pure, inheritable, completeStruct.}" in hdmod
+doAssert "{.pragma: mdtype, pure, inheritable, bycopy, completeStruct.}" in hdmod
 doAssert "{.pragma: mdalias.}" in hdmod
 doAssert "{.pragma: mdinterface.}" in hdmod
 doAssert "when defined(checkAbi)" notin hdmod
@@ -636,7 +636,7 @@ doAssert "  {.pragma: mdheader, header: \"hd.h\".}" in shdmod
 doAssert "else:" in shdmod
 doAssert "  {.pragma: mdheader.}" in shdmod
 doAssert "{.pragma: mdmethod, sideEffect, mdheader.}" in shdmod
-doAssert "{.pragma: mdtype, pure, inheritable, completeStruct, mdheader.}" in shdmod
+doAssert "{.pragma: mdtype, pure, inheritable, bycopy, completeStruct, mdheader.}" in shdmod
 doAssert "{.pragma: mdalias, mdheader.}" in shdmod
 doAssert "{.pragma: mdinterface, mdheader.}" in shdmod
 # symbols still use the file-level pragmas (mdtype / mdalias /
@@ -911,7 +911,7 @@ doAssert "when defined(checkAbi) or defined(mdheaders):" in hwindef.code
 doAssert "  {.pragma: mdheader, header: \"windef.h\".}" in hwindef.code
 doAssert "  {.pragma: mdheader.}" in hwindef.code
 doAssert "mdmethod" notin hwindef.code
-doAssert "{.pragma: mdtype, pure, inheritable, completeStruct, mdheader.}" in hwindef.code
+doAssert "{.pragma: mdtype, pure, inheritable, bycopy, completeStruct, mdheader.}" in hwindef.code
 doAssert "{.pragma: mdalias, mdheader.}" in hwindef.code
 doAssert "POINT* {.mdtype.} = object" in hwindef.code
 # winuser has functions: mdmethod also includes mdheader
