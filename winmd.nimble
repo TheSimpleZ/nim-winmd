@@ -72,8 +72,9 @@ task win32abi, "generate the win32 abi into ../nim-win32-abi":
   exec "nim c -r --verbosity:0 --hints:off -d:release -o:win32abi tools/win32abi.nim"
 
 task test, "Run tests":
+  # listFiles uses the platform's path separator (`tests\test_x.nim` on Windows)
   for t in listFiles("tests/").filterIt(
-    it.startsWith("tests/test") and it.endsWith(".nim")
+    it.extractFilename.startsWith("test") and it.endsWith(".nim")
   ):
     echo "testing ", t
     exec "nim c -d:release -r --hints:off --verbosity:0 " & t
