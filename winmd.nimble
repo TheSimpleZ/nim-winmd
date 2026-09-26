@@ -11,6 +11,7 @@ bin = @["winmd2nim", "winmd2yaml"]
 # Dependencies
 
 requires "nim >= 2.2.10"
+requires "checksums" # SHA-1, for the IIDs of WinRT generic instantiations
 
 # Tasks
 
@@ -45,6 +46,44 @@ task checkabi, "ABI-check the generated bindings against the mingw headers":
   else:
     exec(exe)
 
+# the WinRT metadata the winrt* tasks generate from: the windows-rs copy, or
+# the SDK's union metadata (WINRT_WINMD="C:\Program Files (x86)\Windows
+# Kits\10\UnionMetadata\10.0.26100.0\Windows.winmd")
+proc winrtWinmd(): string =
+  getEnv("WINRT_WINMD", normalizePath("windows-rs/crates/libs/default/Windows.winmd"))
+
+proc generateWinrt(outDir: string) =
+  selfExec("c -d:release --hints:off --verbosity:0 -o:winmd2nim src/winmd2nim.nim")
+  rmDir(outDir)
+  mkDir(outDir)
+  exec("./winmd2nim \"" & winrtWinmd() & "\" " & outDir)
+
+task winrtcheck, "Call the Windows Runtime through the generated WinRT modules":
+  const outDir = "_exper/gen_winrt"
+  generateWinrt(outDir)
+  selfExec("c -r --verbosity:0 --hints:off --path:" & outDir & " tests/winrtabi")
+
+task winrtfull, "Full-surface compile: import every generated WinRT module":
+  const outDir = "_exper/gen_winrt"
+  const agg = outDir & "/zz_temp_agg.nim"
+
+  # generated afresh: modules left by an older generator, or by a run that
+  # failed halfway, would pass without checking this one
+  generateWinrt(outDir)
+
+  let names = listFiles(outDir)
+    .filterIt(it.endsWith(".nim"))
+    .mapIt(splitFile(it).name)
+    .filterIt(it != "zz_temp_agg")
+  writeFile(
+    agg,
+    "# temp aggregate (full-surface compile check)\n" &
+      names.mapIt("import " & it & "\n").join(""),
+  )
+  selfExec(
+    "c --verbosity:0 --hints:off -o:winrt_full_check.exe --path:" & outDir & " " & agg
+  )
+
 task fullcheck, "Full-surface compile: import all generated modules":
   const hdrDir = "_exper/gen_hdr"
   const agg = "_exper/gen_hdr/zz_temp_agg.nim"
@@ -72,8 +111,9 @@ task win32abi, "generate the win32 abi into ../nim-win32-abi":
   exec "nim c -r --verbosity:0 --hints:off -d:release -o:win32abi tools/win32abi.nim"
 
 task test, "Run tests":
+  # listFiles uses the platform's path separator (`tests\test_x.nim` on Windows)
   for t in listFiles("tests/").filterIt(
-    it.startsWith("tests/test") and it.endsWith(".nim")
+    it.extractFilename.startsWith("test") and it.endsWith(".nim")
   ):
     echo "testing ", t
     exec "nim c -d:release -r --hints:off --verbosity:0 " & t

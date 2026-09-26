@@ -1146,8 +1146,8 @@ proc generateCore(
       # this compiler never converts implicitly to distinct types:
       # wrap the literal in an explicit conversion (a value that is
       # already an explicit cast is left as-is)
-      if not cc2.isStr and cc2.ty.name.len > 0 and np.isTypeKind(cc2.ty.name, tkHandle) and tyS != "uint32" and
-          not val.startsWith("cast["):
+      if not cc2.isStr and cc2.ty.name.len > 0 and np.isTypeKind(cc2.ty.name, tkHandle) and
+          tyS != "uint32" and not val.startsWith("cast["):
         let tname = esc(np.nameMap.getOrDefault(cc2.ty.name, fixIdent(cc2.ty.name)))
         val = tname & "(" & val & ")"
       result = (tyS, val, isCast)

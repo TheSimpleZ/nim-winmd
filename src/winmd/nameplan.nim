@@ -26,8 +26,7 @@ type
   ## every emitted name, the stub names, the arch variants, the
   ## suppressed A-aliases, and the name-level reference data the layout
   ## phase consumes.
-  NamePlan* = object
-    ## emitted type name per m.types index
+  NamePlan* = object ## emitted type name per m.types index
     typeNames*: seq[string]
     ## emission order: structs, handles, enums, delegates, interfaces
     order*: seq[int]
@@ -94,8 +93,8 @@ const NimKeywords* = @[
 
 ## System types that render to a Nim builtin (not stubs)
 const SystemBuiltins* = @[
-  "Object", "Void", "Char", "Boolean", "Int32", "UInt32", "Int64", "UInt64",
-  "IntPtr", "UIntPtr", "Guid",
+  "Object", "Void", "Char", "Boolean", "Int32", "UInt32", "Int64", "UInt64", "IntPtr",
+  "UIntPtr", "Guid",
 ]
 
 const HexDigits = "0123456789abcdef"
@@ -263,6 +262,8 @@ proc renderType*(p: NamePlan, t: SigType): string =
     "var " & renderType(p, t.inner[])
   of bArray:
     "array[" & $t.arrLen & ", " & renderArrElem(p, t.inner[]) & "]"
+  of bSzArray, bGenericInst, bTypeVar:
+    "pointer" # not in Win32 metadata; the WinRT generator spells its own
 
 ## The unknown (stubbable) type name referenced by `t`, if any: a named
 ## leaf that is not a model type and not a System builtin.
@@ -314,7 +315,7 @@ proc isUniqueType(p: NamePlan, m: Model, t: SigType, seen: var HashSet[string]):
       result = true # unknown -> stub (opaque object)
   of bPtr:
     result = isUniqueType(p, m, t.inner[], seen)
-  of bByRef, bArray:
+  of bByRef, bArray, bSzArray, bGenericInst, bTypeVar:
     result = false
 
 ## True if `t`'s rendered form is a pointer type: an anonymous `ptr ...`
@@ -593,6 +594,7 @@ proc buildNamePlan*(m: Model): NamePlan =
       let leaf = namedLeaf(ty)
       if leaf.base == bNamed and leaf.ns == "System" and leaf.name == "Guid":
         p.guidUsed = true
+
   for i in 0 ..< m.types.len:
     let t = m.types[i]
     if t.kind == tkHandle or t.kind == tkUnscopedEnum:
