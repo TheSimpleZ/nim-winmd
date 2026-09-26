@@ -1,6 +1,6 @@
 # signatures.nim — ECMA-335 signature blob decoding for winmd2nim.
 # https://ecma-international.org/wp-content/uploads/ECMA-335_6th_edition_june_2012.pdf#%5B%7B%22num%22%3A2749%2C%22gen%22%3A0%7D%2C%7B%22name%22%3A%22XYZ%22%7D%2C87%2C290%2C0%5D
-import std/strutils, ./reader
+import std/[sequtils, strutils], ./reader
 
 type
   Prim* = enum
@@ -26,15 +26,23 @@ type
     bPrim # `prim` field holds the primitive
     bNamed
       # `ns`/`name` hold a TypeDef or TypeRef (struct, enum, handle,
-      # interface, typedef); generic arguments are collapsed away
+      # interface, typedef)
+    bGenericInst
+      # a generic type instantiated with `args`: `ns`/`name`/`rowIdx`
+      # name the generic type definition (``IVector`1``)
+    bTypeVar
+      # a generic parameter by position: `varIdx` into the owning type's
+      # (VAR) or method's (MVAR, `isMethodVar`) generic parameters
     ## decorators (wrap an `inner` type)
     bPtr # `inner` is the pointee
     bByRef # `inner` is the referenced type
     bArray # `inner` is the element, `arrLen` the count
+    bSzArray # `inner` is the element; a single-dimension array of any length
 
-  ## A decoded type as a tree: a leaf (bPrim/bNamed) or a decorator
-  ## (bPtr/bByRef/bArray) wrapping an `inner` type. `inner` is nil for
-  ## leaves; `arrLen` is set for bArray; `isConst` carries the IsConst
+  ## A decoded type as a tree: a leaf (bPrim/bNamed/bGenericInst/bTypeVar)
+  ## or a decorator (bPtr/bByRef/bArray/bSzArray) wrapping an `inner` type.
+  ## `inner` is nil for leaves; `arrLen` is set for bArray; `args` for
+  ## bGenericInst; `varIdx` for bTypeVar; `isConst` carries the IsConst
   ## custom modifier read at the type's outermost level.
   SigType* = object
     base*: Base
@@ -48,6 +56,9 @@ type
     inner*: ref SigType
     arrLen*: int
     isConst*: bool
+    args*: seq[SigType] # bGenericInst: the type arguments, in order
+    varIdx*: int # bTypeVar: generic parameter number
+    isMethodVar*: bool # bTypeVar: MVAR (method) rather than VAR (type)
 
   MethodSig* = object
     flags*: uint8 # raw first byte of the blob
@@ -110,6 +121,17 @@ proc resolveNamed(wa: Winmd, v: int, rowIdx: var int): (string, string) =
 # type decoding
 # ---------------------------------------------------------------------------
 
+proc readType(wa: Winmd, c: var Cursor): SigType # fwd (mutual recursion)
+
+proc decodeTypeSpec*(wa: Winmd, row: int): SigType =
+  ## Decode the type a TypeSpec row spells out (a bare type blob, no prolog):
+  ## in WinRT metadata, a generic instantiation such as ``IVector`1<String>``.
+  var c: Cursor
+  c.b = wa.typeSpec(row).signature
+  result = readType(wa, c)
+  if c.p != c.b.len:
+    badBlob(c.p, "trailing bytes in type spec blob")
+
 proc readType(wa: Winmd, c: var Cursor): SigType =
   # leading custom modifiers (0x1F/0x20 + coded TypeDefOrRef); only IsConst
   # is semantically meaningful for code generation
@@ -125,13 +147,12 @@ proc readType(wa: Winmd, c: var Cursor): SigType =
     result.inner = new(SigType)
     result.inner[] = readType(wa, c)
     return
-  if c.p < c.b.len and c.b[c.p] == 0x1D: # SZARRAY: elemtype + length
+  if c.p < c.b.len and c.b[c.p] == 0x1D: # SZARRAY: elemtype, no length
+    # (ECMA-335 II.23.2.12; the length is only known at run time)
     inc c.p
-    let e = readType(wa, c)
-    result.base = bArray
-    result.arrLen = c.compressed()
+    result.base = bSzArray
     result.inner = new(SigType)
-    result.inner[] = e
+    result.inner[] = readType(wa, c)
     return
   if c.p < c.b.len and c.b[c.p] == 0x0F: # PTR: wraps a pointee (recurse for
     # further pointer layers / other decorators)
@@ -191,23 +212,36 @@ proc readType(wa: Winmd, c: var Cursor): SigType =
     result.base = bPrim
     result.prim = pvU
   of ELEMENT_TYPE_VALUETYPE, ELEMENT_TYPE_CLASS:
-    var row = -1
-    let (ns, name) = resolveNamed(wa, c.compressed(), row)
-    result.base = bNamed
-    result.ns = ns
-    result.name = name
-    result.rowIdx = row
-  of ELEMENT_TYPE_VAR:
+    let v = c.compressed()
+    if (v and 3) == 2: # a TypeSpec (tag 2): its row's blob spells the type out
+      let isConst = result.isConst
+      result = decodeTypeSpec(wa, (v shr 2) - 1)
+      result.isConst = result.isConst or isConst
+    else:
+      var row = -1
+      let (ns, name) = resolveNamed(wa, v, row)
+      result.base = bNamed
+      result.ns = ns
+      result.name = name
+      result.rowIdx = row
+  of ELEMENT_TYPE_GENERICINST:
+    # GENERICINST (CLASS | VALUETYPE) TypeDefOrRef GenArgCount Type*
+    # (II.23.2.12)
     discard c.u8()
     var row = -1
     let (ns, name) = resolveNamed(wa, c.compressed(), row)
     let n = c.compressed()
-    for _ in 0 ..< n:
-      discard readType(wa, c)
-    result.base = bNamed
+    result.base = bGenericInst
     result.ns = ns
     result.name = name
     result.rowIdx = row
+    result.args = newSeqWith(n, readType(wa, c))
+  of ELEMENT_TYPE_VAR, ELEMENT_TYPE_MVAR:
+    # VAR / MVAR number: a generic parameter of the owning type / method
+    result.base = bTypeVar
+    result.varIdx = c.compressed()
+    result.isMethodVar = code == ELEMENT_TYPE_MVAR
+    result.rowIdx = -1
   of ELEMENT_TYPE_OBJECT: # OBJECT
     result.base = bNamed
     result.ns = "System"
@@ -258,7 +292,7 @@ proc decodeFieldSig*(wa: Winmd, blob: seq[byte]): SigType =
 ## decorators).
 proc namedLeaf*(ty: SigType): SigType =
   var cur = ty
-  while cur.base == bPtr or cur.base == bByRef or cur.base == bArray:
+  while cur.base in {bPtr, bByRef, bArray, bSzArray}:
     cur = cur.inner[]
   cur
 
@@ -275,8 +309,11 @@ proc decodeMethodSig*(wa: Winmd, blob: seq[byte]): MethodSig =
   result.flags = c.u8()
   # NB: first byte is the MethodCallAttributes flags (0x20 = HASTHIS, 0x10 =
   # GENERIC, 0x05 = VARARG, 0x01 = EXPLICITTHIS). No extra prolog byte: the
-  # next compressed integer is the param count (mirrors the windows-rs reader;
-  # this file has no generic methods).
+  # next compressed integer is the param count (mirrors the windows-rs reader),
+  # after the generic parameter count of a GENERIC one (II.23.2.1), whose
+  # parameters its MVARs number
+  if (result.flags and 0x10) != 0:
+    discard c.compressed()
   let n = c.compressed()
   result.ret = readType(wa, c)
   result.params = newSeq[SigType](n)

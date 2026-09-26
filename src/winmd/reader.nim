@@ -65,6 +65,8 @@ type
     ckTypeOrMethodDef
     ckHasSemantics
     ckHasFieldMarshal
+    ckMethodDefOrRef
+    ckImplementation
 
   Winmd* = ref object
     data*: seq[byte]
@@ -198,6 +200,12 @@ type
     owner*: CodedRef # TypeOrMethodDef: TypeDef=0, MethodDef=1
     name*: string
 
+  MethodImplRow* = object
+    ## https://github.com/stakx/ecma-335/blob/f181e4696eebcbbc7c2b1e5d0a2ee289f2884d2d/docs/ii.22.27-methodimpl-0x19.md
+    class*: int # TypeDef
+    methodBody*: CodedRef # MethodDefOrRef: MethodDef=0, MemberRef=1
+    methodDeclaration*: CodedRef # MethodDefOrRef
+
   ## One argument of a serialized custom attribute. Positional args have
   ## `name == ""` and `namedType == 0`.
   AttributeArg* = object
@@ -279,6 +287,8 @@ proc codedBits(k: CodedKind): int =
   of ckTypeOrMethodDef: 1
   of ckHasSemantics: 1
   of ckHasFieldMarshal: 2
+  of ckMethodDefOrRef: 1
+  of ckImplementation: 2
 
 proc codedTables(k: CodedKind): set[TableId] =
   ## Tables in the coded set (their row counts decide the storage width).
@@ -307,6 +317,10 @@ proc codedTables(k: CodedKind): set[TableId] =
     {Event, Property}
   of ckHasFieldMarshal:
     {Field}
+  of ckMethodDefOrRef:
+    {MethodDef, MemberRef}
+  of ckImplementation:
+    {File, AssemblyRef, ExportedType}
 
 proc codedWidth(wa: Winmd, k: CodedKind): int =
   ## 2 if every table in the set has < 2^(16-bits) rows, else 4.
@@ -368,6 +382,10 @@ proc codedTag(k: CodedKind, tag: int): TableId =
     @[Event, Property][tag]
   of ckHasFieldMarshal:
     @[Field][tag]
+  of ckMethodDefOrRef:
+    @[MethodDef, MemberRef][tag]
+  of ckImplementation:
+    @[File, AssemblyRef, ExportedType][tag]
 
 proc codedTagValue(k: CodedKind, t: TableId): int =
   ## Reverse mapping, used to build search targets.
@@ -647,8 +665,8 @@ const
   modeledTables = {
     Module, TypeRef, TypeDef, Field, MethodDef, MethodParam, InterfaceImpl, MemberRef,
     Constant, CustomAttribute, FieldMarshal, FieldLayout, ClassLayout, EventMap, Event,
-    PropertyMap, Property, MethodSemantics, ModuleRef, TypeSpec, ImplMap, Assembly,
-    AssemblyRef, NestedClass, GenericParam,
+    PropertyMap, Property, MethodSemantics, MethodImpl, ModuleRef, TypeSpec, ImplMap,
+    Assembly, AssemblyRef, ExportedType, NestedClass, GenericParam,
   }
 
 proc idxBytes(wa: Winmd, t: TableId): int =
@@ -690,7 +708,7 @@ proc rowSize(wa: Winmd, t: TableId): int =
   of Property:
     2 + strW + blobW
   of MethodSemantics:
-    2 + wa.idxBytes(TypeDef) + wa.codedWidth(ckHasSemantics)
+    2 + wa.idxBytes(MethodDef) + wa.codedWidth(ckHasSemantics)
   of ModuleRef:
     strW
   of TypeSpec:
@@ -709,6 +727,10 @@ proc rowSize(wa: Winmd, t: TableId): int =
     wa.codedWidth(ckHasFieldMarshal) + blobW
   of FieldLayout:
     wa.idxBytes(Field) + 4
+  of MethodImpl:
+    wa.idxBytes(TypeDef) + 2 * wa.codedWidth(ckMethodDefOrRef)
+  of ExportedType: # the type forwarders of an SDK contract whose types moved
+    8 + 2 * strW + wa.codedWidth(ckImplementation)
   else:
     0
 
@@ -1111,6 +1133,12 @@ proc genericParam*(wa: Winmd, i: int): GenericParamRow =
   result.owner = r.coded(ckTypeOrMethodDef)
   result.name = r.`string`()
 
+proc methodImpl*(wa: Winmd, i: int): MethodImplRow =
+  var r = rowReader(wa, MethodImpl, i)
+  result.class = r.rowIdx(TypeDef)
+  result.methodBody = r.coded(ckMethodDefOrRef)
+  result.methodDeclaration = r.coded(ckMethodDefOrRef)
+
 # ---------------------------------------------------------------------------
 # lookups
 # ---------------------------------------------------------------------------
@@ -1174,6 +1202,14 @@ proc propertiesOf*(wa: Winmd, i: int): Slice[int] =
   result.a = wa.propertyMap(i).propertyListStart
   result.b = b - 1
 
+proc codedAt(wa: Winmd, k: CodedKind, off: int): uint32 =
+  ## The coded index of kind `k` stored at `off`: 2 bytes wide when every
+  ## table of its set is small (codedWidth), as in a small winmd, else 4.
+  if wa.codedWidth(k) == 2:
+    uint32(u16(wa.data, off))
+  else:
+    u32(wa.data, off)
+
 ## The ImplMap row forwarded to `methodDefIdx` (ImplMap column 1 is sorted by
 ## the MemberForwarded coded value; binary search).
 proc implMapFor*(wa: Winmd, methodDefIdx: int): Option[ImplMapRow] =
@@ -1183,7 +1219,7 @@ proc implMapFor*(wa: Winmd, methodDefIdx: int): Option[ImplMapRow] =
   var hi = wa.rowCount(ImplMap) - 1
   while lo <= hi:
     let mid = (lo + hi) shr 1
-    let v = u32(wa.data, base + mid * w + 2)
+    let v = wa.codedAt(ckMemberForwarded, base + mid * w + 2)
     if v < target:
       lo = mid + 1
     elif v > target:
@@ -1198,7 +1234,7 @@ proc constantFor*(wa: Winmd, fieldIdx: int): Option[ConstantRow] =
   let target = uint32(fieldIdx + 1) shl 2 # HasConstant: Field tag = 0
   let (base, w) = (wa.rowOff[int(Constant)], wa.rowSize[int(Constant)])
   for i in 0 ..< wa.rowCount(Constant):
-    if u32(wa.data, base + i * w + 2) == target:
+    if wa.codedAt(ckHasConstant, base + i * w + 2) == target:
       return some(wa.constant(i))
   return none[ConstantRow]()
 
@@ -1212,17 +1248,19 @@ proc customAttributesFor*(wa: Winmd, parent: CodedRef): seq[CustomAttributeRow] 
   var hi = wa.rowCount(CustomAttribute) - 1
   while lo <= hi:
     let mid = (lo + hi) shr 1
-    let v = u32(wa.data, base + mid * w)
+    let v = wa.codedAt(ckHasCustomAttribute, base + mid * w)
     if v < target:
       lo = mid + 1
     elif v > target:
       hi = mid - 1
     else:
       var first = mid
-      while first > 0 and u32(wa.data, base + (first - 1) * w) == target:
+      while first > 0 and
+          wa.codedAt(ckHasCustomAttribute, base + (first - 1) * w) == target:
         dec first
       var last = mid
-      while last + 1 <= hi and u32(wa.data, base + (last + 1) * w) == target:
+      while last + 1 <= hi and
+          wa.codedAt(ckHasCustomAttribute, base + (last + 1) * w) == target:
         inc last
       for i in first .. last:
         result.add(wa.customAttribute(i))

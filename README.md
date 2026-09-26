@@ -36,6 +36,9 @@ nim c -d:release src/winmd2nim.nim
 src/winmd2nim <input.winmd> <outdir> [symbol=module map file | rdl dir]
 ```
 
+It needs the `checksums` package (`nimble install checksums`), the
+official home of what was `std/sha1`.
+
 Arguments:
 
 * `<input.winmd>` — the metadata file, e.g. `Windows.Win32.winmd`

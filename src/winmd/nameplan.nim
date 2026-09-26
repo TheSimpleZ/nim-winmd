@@ -262,6 +262,8 @@ proc renderType*(p: NamePlan, t: SigType): string =
     "var " & renderType(p, t.inner[])
   of bArray:
     "array[" & $t.arrLen & ", " & renderArrElem(p, t.inner[]) & "]"
+  of bSzArray, bGenericInst, bTypeVar:
+    "pointer" # not in Win32 metadata; the WinRT generator spells its own
 
 ## The unknown (stubbable) type name referenced by `t`, if any: a named
 ## leaf that is not a model type and not a System builtin.
@@ -313,7 +315,7 @@ proc isUniqueType(p: NamePlan, m: Model, t: SigType, seen: var HashSet[string]):
       result = true # unknown -> stub (opaque object)
   of bPtr:
     result = isUniqueType(p, m, t.inner[], seen)
-  of bByRef, bArray:
+  of bByRef, bArray, bSzArray, bGenericInst, bTypeVar:
     result = false
 
 ## True if `t`'s rendered form is a pointer type: an anonymous `ptr ...`

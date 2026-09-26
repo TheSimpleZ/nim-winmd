@@ -11,6 +11,7 @@ bin = @["winmd2nim", "winmd2yaml"]
 # Dependencies
 
 requires "nim >= 2.2.10"
+requires "checksums" # SHA-1, for the IIDs of WinRT generic instantiations
 
 # Tasks
 

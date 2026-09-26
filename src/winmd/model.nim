@@ -7,7 +7,10 @@
 #       System.MulticastDelegate -> delegate, System.Attribute -> skipped,
 #       null -> interface, anything else -> class (only "Apis" exists; it is
 #       expanded into fns/consts, not a type)
-#   - Windows.Win32.winmd contains no WinRT (0x4000) types.
+#   - WinRT types (TypeAttributes 0x4000, Windows.winmd only) fill the
+#     `isWinRT` fields of ModelType. A runtime class is an interface by the
+#     `extends` rule above; lacking TypeAttributes.Interface (0x20) is what
+#     tells it apart.
 #   - handles = single-field structs carrying NativeTypedefAttribute
 #   - enums are scoped when they carry ScopedEnumAttribute
 #   - functions = every ImplMap row
@@ -17,8 +20,9 @@
 #   - free constants = non-enum fields that have a Constant row
 #     (80387 in Windows.Win32.winmd; enum members are kept on the enum).
 
-import std/[unicode, tables]
-import ./[signatures, reader]
+import std/[options, sequtils, unicode, tables]
+import ./[guid, signatures, reader]
+export guid
 
 type
   TypeKind* = enum
@@ -50,7 +54,7 @@ type
     nimName*: string # fixIdent(name): the entry's Nim identifier
     defRow*: int # TypeDef row index (for nested-type reference resolution)
     fields*: seq[ModelField] # struct/handle members or enum values
-    ret*: SigType # delegates only
+    ret*: SigType # Win32 delegates only (a WinRT one has its Invoke in `methods`)
     underlying*: SigType # handles and enums
     hasUnderlying*: bool
     arch*: set[Architecture] # SupportedArchitectureAttribute (empty = arch-neutral)
@@ -59,6 +63,17 @@ type
       # struct's fields are overlaid (a C union)
     packSize*: int # ClassLayout packing (1 = packed, 0 = natural)
     alignSize*: int # AlignmentAttribute forced alignment (0 = none)
+    isWinRT*: bool # TypeAttributes.WindowsRuntime (0x4000)
+    isClass*: bool
+      # a WinRT runtime class: a tkInterface without TypeAttributes.Interface
+      # (0x20)
+    guid*: Option[Guid] # GuidAttribute: the IID of a WinRT interface or delegate
+    methods*: seq[ModelFn] # WinRT interfaces and delegates, in vtable order
+    defaultInterface*: Option[SigType]
+      # a WinRT runtime class's DefaultAttribute interface; none for a static
+      # class
+    interfaces*: seq[SigType] # WinRT types: the interfaces required or implemented
+    genericParameters*: seq[string] # generic types (``IVector`1``)
 
   ModelParam* = object
     name*: string # the symbol name as in the winmd
@@ -226,6 +241,19 @@ proc supportedArchs(
         if (bits and 4) != 0:
           result.incl arm64
 
+func guidOf(wa: Winmd, attrs: seq[CustomAttributeRow], owners: seq[int]): Option[Guid] =
+  ## The GUID of the first GuidAttribute among `attrs`, if any. The
+  ## attribute's value blob is prolog(2) + the 16 bytes + named-count(2).
+  let a =
+    attrs.findIt(wa.ctorTypeName(it, owners) == "GuidAttribute" and it.value.len == 20)
+  if a == -1:
+    return
+  some(guidFromMemory(attrs[a].value.toOpenArray(2, 17)))
+
+func namedType(r: TypeDefRow | TypeRefRow): SigType =
+  ## A reference to the type row `r` defines or names.
+  SigType(base: bNamed, ns: r.namespace, name: r.name, rowIdx: -1)
+
 ## Map: TypeDef index -> ClassLayout packing (0 if no ClassLayout row).
 proc classLayoutPackingMap(wa: Winmd): seq[int] =
   result = newSeq[int](wa.rowCount(TypeDef))
@@ -314,6 +342,65 @@ proc build*(wa: Winmd): Model =
     if ty.inner != nil:
       resolveNested(ty.inner[], parentRow)
 
+  # ---- WinRT -----------------------------------------------------------------
+  # TypeDef row -> the names of its generic parameters (the rows are in
+  # parameter order)
+  var genericParameters: Table[int, seq[system.string]]
+  for i in 0 ..< wa.rowCount(GenericParam):
+    let gp = wa.genericParam(i)
+    if gp.owner.kind == TypeDef:
+      genericParameters.mgetOrPut(gp.owner.row, @[]).add gp.name
+
+  # WinRT TypeDef row -> the interfaces it requires or implements, and the one
+  # that carries DefaultAttribute: a runtime class's default interface
+  var interfaces: Table[int, seq[SigType]]
+  var defaultInterface: Table[int, SigType]
+  for i in 0 ..< wa.rowCount(InterfaceImpl):
+    let impl = wa.interfaceImpl(i)
+    if (wa.typeDef(impl.typedef).flags and 0x4000) == 0:
+      continue # a COM interface's base: the Win32 generator does not use it
+    let iface = impl.interfaceType
+    # a TypeSpec spells out a parameterised interface, IMap<String, String>
+    let ty =
+      case iface.kind
+      of TypeSpec:
+        decodeTypeSpec(wa, iface.row)
+      of TypeDef:
+        namedType(wa.typeDef(iface.row))
+      else:
+        namedType(wa.typeRef(iface.row))
+    interfaces.mgetOrPut(impl.typedef, @[]).add ty
+    let attrs = wa.customAttributesFor(typedRef(InterfaceImpl, i))
+    if wa.attributeNamed(attrs, "DefaultAttribute", owners).isSome:
+      defaultInterface[impl.typedef] = ty
+
+  proc methodsFor(t: int, only = ""): seq[ModelFn] =
+    ## The methods of TypeDef `t` (only the one named `only`, when given),
+    ## each named as the ABI names it (an overload by its OverloadAttribute, as
+    ## the SDK headers do) and each parameter by the Param row with its
+    ## Sequence (1 is the first parameter, 0 the return value), or `arg_<n>`
+    ## when it has none.
+    for md in wa.methodsOf(t):
+      let mr = wa.methodDef(md)
+      if only.len > 0 and mr.name != only:
+        continue
+      let sig = decodeMethodSig(wa, mr.signature)
+      var name = mr.name
+      let attrs = wa.customAttributesFor(typedRef(MethodDef, md))
+      let overload = wa.attributeNamed(attrs, "OverloadAttribute", owners)
+      if overload.isSome:
+        let arg = wa.attributeArgs(overload.get, 1)[0].value
+        name = arg.toOpenArrayChar(0, arg.high).substr()
+      var names = (1 .. sig.params.len).mapIt("arg_" & $it)
+      for pi in wa.paramsOf(md):
+        let pr = wa.methodParam(pi)
+        if int(pr.sequence) in 1 .. names.len and pr.name.len > 0:
+          names[pr.sequence - 1] = pr.name
+      var fn = ModelFn(name: name, nimName: fixIdent(name), ret: sig.ret)
+      for i, ty in sig.params:
+        fn.params.add ModelParam(name: names[i], nimName: fixIdent(names[i]), ty: ty)
+      result.add fn
+
   # ---- types -----------------------------------------------------------------
   for t in 0 ..< nTypes:
     let td = wa.typeDef(t)
@@ -329,6 +416,13 @@ proc build*(wa: Winmd): Model =
     let isUnion = (td.flags and 0x10) != 0 # TypeAttributes.ExplicitLayout
     let packSize = clPacking[t]
     let alignSize = wa.alignmentOf(attrs, owners)
+    let isWinRT = (td.flags and 0x4000) != 0 # TypeAttributes.WindowsRuntime
+    # the IID of a WinRT interface or delegate (COM IIDs are not used yet)
+    let guid =
+      if isWinRT:
+        wa.guidOf(attrs, owners)
+      else:
+        none(Guid)
 
     case kind
     of tkInterface:
@@ -351,6 +445,22 @@ proc build*(wa: Winmd): Model =
         isUnion: isUnion,
         packSize: packSize,
         alignSize: alignSize,
+        isWinRT: isWinRT,
+        isClass: isWinRT and (td.flags and 0x20) == 0,
+        guid: guid,
+        # a runtime class's own methods implement its interfaces' (MethodImpl)
+        methods:
+          if guid.isSome:
+            methodsFor(t)
+          else:
+            @[],
+        defaultInterface:
+          if t in defaultInterface:
+            some(defaultInterface[t])
+          else:
+            none(SigType),
+        interfaces: interfaces.getOrDefault(t),
+        genericParameters: genericParameters.getOrDefault(t),
       )
     of tkEnum:
       var m = ModelType(
@@ -363,6 +473,7 @@ proc build*(wa: Winmd): Model =
         isUnion: isUnion,
         packSize: packSize,
         alignSize: alignSize,
+        isWinRT: isWinRT,
       )
       for f in wa.fieldsOf(t):
         let fr = wa.field(f)
@@ -395,6 +506,7 @@ proc build*(wa: Winmd): Model =
         isUnion: isUnion,
         packSize: packSize,
         alignSize: alignSize,
+        isWinRT: isWinRT,
       )
       for f in wa.fieldsOf(t):
         let fr = wa.field(f)
@@ -419,19 +531,28 @@ proc build*(wa: Winmd): Model =
         isUnion: isUnion,
         packSize: packSize,
         alignSize: alignSize,
+        isWinRT: isWinRT,
+        guid: guid,
+        genericParameters: genericParameters.getOrDefault(t),
       )
-      for md in wa.methodsOf(t):
-        let mr = wa.methodDef(md)
-        if mr.name == "Invoke":
-          var sig = decodeMethodSig(wa, mr.signature)
-          resolveNested(sig.ret, t)
-          for i in 0 ..< sig.params.len:
-            resolveNested(sig.params[i], t)
-          m.ret = sig.ret
-          for i in 0 ..< sig.params.len:
-            let an = "arg_" & $(i + 1)
-            m.fields.add ModelField(name: an, nimName: fixIdent(an), ty: sig.params[i])
-          break
+      if isWinRT:
+        # a WinRT delegate is a COM interface with one method, Invoke
+        m.methods = methodsFor(t, only = "Invoke")
+      else:
+        for md in wa.methodsOf(t):
+          let mr = wa.methodDef(md)
+          if mr.name == "Invoke":
+            var sig = decodeMethodSig(wa, mr.signature)
+            resolveNested(sig.ret, t)
+            for i in 0 ..< sig.params.len:
+              resolveNested(sig.params[i], t)
+            m.ret = sig.ret
+            for i in 0 ..< sig.params.len:
+              let an = "arg_" & $(i + 1)
+              m.fields.add ModelField(
+                name: an, nimName: fixIdent(an), ty: sig.params[i]
+              )
+            break
       result.types.add m
 
   # ---- functions ----------------------------------------------------------------
