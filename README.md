@@ -60,6 +60,45 @@ The name mapping file, or equivalently the `.rdl` files, assign names to specifi
 Nim modules based on the header they originated from instead of relying on
 namespace and dll name found in the .winmd file.
 
+Given WinRT metadata (`Windows.winmd`), the output is the Windows Runtime ABI
+instead: `winrtbase.nim` (`GUID`, `HRESULT`, `HSTRING`, `WCHAR`, `IUnknown`,
+`IInspectable`), `winrttypes.nim` (every enum, and every struct that mentions
+no interface), `winrtgenerics.nim` (the IIDs of the instantiations of
+parameterised interfaces, `IID_IVector_HSTRING`) and one module per namespace,
+named without the `Windows` root every namespace shares (`foundation.nim`,
+`ui_xaml.nim`, ...), with its interfaces, delegates and runtime classes, and
+the structs that mention them: an interface is an object whose `lpVtbl` points
+to its vtable, as in the SDK headers. Namespaces that refer to each other in a
+cycle (Nim modules cannot) share one module, `applicationmodel_group.nim`,
+which each of their modules re-exports, so `import storage` works either way.
+An enum is a distinct type over its integer with its members as constants
+(`AsyncStatus_Started`), as windows-rs has them, so it holds any value Windows
+returns; [Flags] ones combine with `or` and `and`, and test with `in`. Every
+method returns `HRESULT`, the declared return becoming a trailing `retval`
+out-parameter; a runtime class is its default interface. An IID is a `GUID`
+constant named after its type and written as text, which `winrtbase`'s `guid`
+turns into a `GUID` at compile time
+(`IID_IStringable*: GUID = guid"96369f54-8eb6-48f0-abce-c1b211e627c3"`):
+`IID_IStringable` for an interface or delegate,
+`IID_IVector` for a parameterised one and `IID_IVector_HSTRING` for an
+instantiation. Besides what the enums borrow (and `winrtbase`'s `guid`), the
+output is types and constants, as the Win32 generator's; a friendlier layer
+belongs in a library on top. See `tests/winrtabi.nim` for an example.
+The IIDs of instantiations exist for the instantiations the metadata mentions,
+which is every one a Windows API can hand out, not for ones of your own.
+A name two namespaces share is kept by the first type and suffixed on the
+other (`AnimationDirection_2`, whose members are `AnimationDirection_2_Left`,
+...), never taking the name of a type of the metadata.
+
+The WinRT metadata should define every type it mentions, as the SDK's union
+metadata (`UnionMetadata\<version>\Windows.winmd`) and the windows-rs copy do.
+From a winmd that mentions the types of another (a contract winmd of the SDK,
+or a component's, such as WinUI's), a method that mentions one is a bare
+`pointer` in its vtable, a struct with a field of one is left out, its layout
+unknown, and so is a runtime class whose default interface is one; a classic
+COM interface (a type without the `WindowsRuntime` flag) is left out too. The
+options and the map are for Win32 metadata, and refused for WinRT.
+
 ### `winmdyaml` — winmd YAML dumper
 
 Prints a YAML representation of the contents in a `.winmd` file:
@@ -81,6 +120,16 @@ The repository has nimble tasks (`nimble tasks`):
   (writing a `SOURCE.env` with git provenance tags); the bindings are
   generated with `--headers` by default, and extra `winmd2nim` flags
   (e.g. `--lowercase`) go in the `WINMDFLAGS` environment variable
+* `nimble winrtcheck` — generate the WinRT modules and call the Windows
+  Runtime through them (Windows only)
+* `nimble winrtfull` — generate the WinRT modules and compile all of them
+  (import every one)
+
+The winrt tasks read the windows-rs copy of `Windows.winmd`, or the file
+`WINRT_WINMD` names (the SDK's union metadata, for instance). The tasks
+compile with the `nim` nimble puts first, its own copy when it has installed
+one for the package; if that one does not match your C compiler, run them
+with `nimble --useSystemNim <task>`.
 
 The tests and the tools use the `windows-rs` git submodule at the repo
 root (the winmd and the per-header RDL snapshot); the `winmd2nim` /
