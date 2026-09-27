@@ -2,6 +2,7 @@ nimble.develop
 nimble.paths
 nimbledeps
 /tests/test_generator
+/tests/test_guid
 /tests/test_model
 /tests/test_signatures
 /tests/test_winmd
