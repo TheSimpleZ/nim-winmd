@@ -40,14 +40,14 @@ Arguments:
 
 * `<input.winmd>` — the metadata file, e.g. `Windows.Win32.winmd`
 * `<outdir>` — output directory (created if missing)
-* optional third argument — symbol-to-module map:
+* optional third argument (Win32 only) — symbol-to-module map:
   * a text file of `symbol=module` lines (default: `type_headers.txt`), or
   * a directory containing the per-header RDL snapshot the winmd was built
     from (e.g. the `metadata/` directory of the `windows-rs` project); the
     declared names in the `.rdl` files are read directly and produce the same
     mapping as `type_headers.txt` file
 
-Output layout:
+Output layout for Win32 metadata:
 
 * `win32base.nim` — shared types without header provenance (only when non-empty)
 * `<mapped_name>.nim` — names taken from name mapping file
@@ -56,6 +56,19 @@ Output layout:
 The name mapping file, or equivalently the `.rdl` files, assign names to specific
 Nim modules based on the header they originated from instead of relying on
 namespace and dll name found in the .winmd file.
+
+For WinRT metadata (`Windows.winmd`), it writes the Windows Runtime ABI
+instead:
+
+* `winrtbase.nim` — `GUID`, `HRESULT`, `HSTRING`, `IUnknown`, `IInspectable`
+* `winrttypes.nim` — enums and structs
+* `winrtgenerics.nim` — IIDs of generic instantiations (`IID_IVector_HSTRING`)
+* `<namespace>.nim` — interfaces, delegates and runtime classes, named
+  without the `Windows.` prefix (`foundation.nim`, `ui_xaml.nim`)
+
+Use the SDK's union metadata or the windows-rs copy: types from other winmds
+become bare `pointer`s. See `tests/winrtcheck.nim` for calling the Windows
+Runtime through the bindings.
 
 ### `winmdyaml` — winmd YAML dumper
 
@@ -78,6 +91,13 @@ The repository has nimble tasks (`nimble tasks`):
   (writing a `SOURCE.env` with git provenance tags); the bindings are
   generated with `--headers` by default, and extra `winmd2nim` flags
   (e.g. `--lowercase`) go in the `WINMDFLAGS` environment variable
+* `nimble winrtabi` — generate the WinRT bindings into `../nim-winrt-abi`
+* `nimble winrtcheck` — generate them and call the Windows Runtime through
+  them (Windows only)
+* `nimble winrtfull` — generate them and compile every module
+
+The winrt tasks read windows-rs's `Windows.winmd`, or the file `WINRT_WINMD`
+names.
 
 The tests and the tools use the `windows-rs` git submodule at the repo
 root (the winmd and the per-header RDL snapshot); the `winmd2nim` /

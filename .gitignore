@@ -5,7 +5,12 @@ nimbledeps
 /tests/test_guid
 /tests/test_model
 /tests/test_signatures
+/tests/test_tools
 /tests/test_winmd
+/tests/test_winrt
+/tests/test_winrt_components
+/tests/test_winrt_plan
+/tests/test_winrt_render
 /winmd2nim
 /winmd2yaml
 /checkabi
@@ -13,3 +18,4 @@ nimbledeps
 /tools/checkabi
 /tools/win32abi
 *.exe
+/_exper/

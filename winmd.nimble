@@ -46,6 +46,44 @@ task checkabi, "ABI-check the generated bindings against the mingw headers":
   else:
     exec(exe)
 
+# the windows-rs Windows.winmd, or the WINRT_WINMD file
+proc winrtWinmd(): string =
+  getEnv("WINRT_WINMD", normalizePath("windows-rs/crates/libs/default/Windows.winmd"))
+
+proc generateWinrt(outDir: string) =
+  selfExec("c -d:release --hints:off --verbosity:0 -o:winmd2nim src/winmd2nim.nim")
+  rmDir(outDir)
+  mkDir(outDir)
+  exec("./winmd2nim \"" & winrtWinmd() & "\" " & outDir)
+
+task winrtabi, "generate the WinRT ABI into ../nim-winrt-abi":
+  generateWinrt("../nim-winrt-abi/winrt/abi")
+
+task winrtcheck, "Call the Windows Runtime through the generated WinRT modules":
+  const outDir = "_exper/gen_winrt"
+  generateWinrt(outDir)
+  selfExec("c -r --verbosity:0 --hints:off --path:" & outDir & " tests/winrtcheck")
+
+task winrtfull, "Full-surface compile: import every generated WinRT module":
+  const outDir = "_exper/gen_winrt"
+  const agg = outDir & "/zz_temp_agg.nim"
+
+  # afresh, so stale modules cannot pass
+  generateWinrt(outDir)
+
+  let names = listFiles(outDir)
+    .filterIt(it.endsWith(".nim"))
+    .mapIt(splitFile(it).name)
+    .filterIt(it != "zz_temp_agg")
+  writeFile(
+    agg,
+    "# temp aggregate (full-surface compile check)\n" &
+      names.mapIt("import " & it & "\n").join(""),
+  )
+  selfExec(
+    "c --verbosity:0 --hints:off -o:winrt_full_check.exe --path:" & outDir & " " & agg
+  )
+
 task fullcheck, "Full-surface compile: import all generated modules":
   const hdrDir = "_exper/gen_hdr"
   const agg = "_exper/gen_hdr/zz_temp_agg.nim"
