@@ -45,6 +45,13 @@ proc sigStr(t: SigType): string =
     "byref " & sigStr(t.inner[])
   of bArray:
     "array[" & $t.arrLen & ", " & sigStr(t.inner[]) & "]"
+  of bSzArray:
+    sigStr(t.inner[]) & "[]"
+  of bGenericInst:
+    (if t.ns.len > 0: t.ns & "." & t.name else: t.name) & "<" &
+      t.args.map(sigStr).join(", ") & ">"
+  of bTypeVar:
+    (if t.isMethodVar: "!!" else: "!") & $t.varIdx
 
 ## Render a decoded method signature as "ret(p1, p2, ...)"; undecodable
 ## blobs fall back to a hex dump.
@@ -60,13 +67,39 @@ proc methodSigStr(blob: seq[byte]): string =
   except Exception:
     result = "<undecoded: " & hexBytes(blob) & ">"
 
-## Render a decoded field/property/memberRef/typeSpec signature (prolog
-## 0x06); undecodable blobs fall back to a hex dump.
+## Render a decoded field signature (prolog 0x06); undecodable blobs fall
+## back to a hex dump.
 proc fieldSigStr(blob: seq[byte]): string =
   try:
     result = sigStr(decodeFieldSig(wa, blob))
   except Exception:
     result = "<undecoded: " & hexBytes(blob) & ">"
+
+proc propertySigStr(blob: seq[byte]): string =
+  ## Render a decoded property signature.
+  try:
+    let ps = decodeMethodSig(wa, blob)
+    result =
+      if ps.params.len == 0:
+        sigStr(ps.ret)
+      else:
+        methodSigStr(blob)
+  except Exception:
+    result = "<undecoded: " & hexBytes(blob) & ">"
+
+proc memberRefSigStr(blob: seq[byte]): string =
+  ## Render a decoded MemberRef signature, a field's or a method's.
+  if blob.len > 0 and blob[0] == 0x06:
+    fieldSigStr(blob)
+  else:
+    methodSigStr(blob)
+
+proc typeSpecStr(row: int): string =
+  ## Render the type of TypeSpec `row`.
+  try:
+    result = sigStr(decodeTypeSpec(wa, row))
+  except Exception:
+    result = "<undecoded: " & hexBytes(wa.typeSpec(row).signature) & ">"
 
 # Owner maps for readable parent names (O(total), fine for a debug dump).
 let owners = methodOwnerMap(wa)
@@ -200,7 +233,7 @@ for i in 0 ..< wa.rowCount(PropertyMap):
         ", flags: ",
         toHex(p.propertyFlags),
         ", type: ",
-        escapeJson(fieldSigStr(p.`type`)),
+        escapeJson(propertySigStr(p.`type`)),
         "}"
 
 echo "modules:"
@@ -275,7 +308,7 @@ for i in 0 ..< wa.rowCount(MemberRef):
     ", name: ",
     escapeJson(mr.name),
     ", type: ",
-    escapeJson(fieldSigStr(mr.signature)),
+    escapeJson(memberRefSigStr(mr.signature)),
     "}"
 
 echo "constants:"
@@ -329,8 +362,7 @@ for i in 0 ..< wa.rowCount(ModuleRef):
 
 echo "typeSpecs:"
 for i in 0 ..< wa.rowCount(TypeSpec):
-  let ts = wa.typeSpec(i)
-  echo "  - {type: ", escapeJson(fieldSigStr(ts.signature)), "}"
+  echo "  - {type: ", escapeJson(typeSpecStr(i)), "}"
 
 echo "implMaps:"
 for i in 0 ..< wa.rowCount(ImplMap):

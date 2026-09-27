@@ -60,6 +60,16 @@ jobs:
         shell: pwsh
         run: |
           nimble fullcheck
+
+      - name: "WinRT: call the Windows Runtime through the generated modules"
+        shell: pwsh
+        run: |
+          nimble winrtcheck
+
+      - name: "WinRT: full-surface compile (all generated modules)"
+        shell: pwsh
+        run: |
+          nimble winrtfull
   lint:
     name: "Check formatting"
     runs-on: ubuntu-latest
