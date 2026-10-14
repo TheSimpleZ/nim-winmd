@@ -80,7 +80,7 @@ func slotType(s: VtableSlot): string =
   if s.parameters.isNone:
     return "pointer # signature not mapped"
   let list = s.parameters.get.mapIt(fmt"{it.name}: {spell(it.ty)}").join(", ")
-  fmt"proc({list}): HRESULT {{.stdcall.}}"
+  fmt"proc({list}): HRESULT {{.mdslot.}}"
 
 func typeDeclaration(d: Declaration): seq[string] =
   ## The declaration of `d` in a type section.
@@ -149,6 +149,8 @@ const
   aliasPragma = "{.pragma: mdalias.}"
   interfacePragma = "{.pragma: mdinterface.}"
   vtablePragma = "{.pragma: mdvtbl, pure, inheritable.}"
+  slotPragma = "{.pragma: mdslot, stdcall, raises: [].}"
+    ## a C function: raises nothing, so a `=destroy` can release through one
 
 func declarationsFile(k: Module): string =
   ## winrttypes or a namespace module. Parameterised interfaces come first,
@@ -169,7 +171,7 @@ func declarationsFile(k: Module): string =
     if k.kind == mkTypes:
       @[structPragma]
     else:
-      @[structPragma, aliasPragma, interfacePragma, vtablePragma]
+      @[structPragma, aliasPragma, interfacePragma, vtablePragma, slotPragma]
   let imports = k.imports.join(", ")
   fmt"""
 {header(k.name, about)}

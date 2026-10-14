@@ -70,6 +70,10 @@ Use the SDK's union metadata or the windows-rs copy: types from other winmds
 become bare `pointer`s. See `tests/winrtcheck.nim` for calling the Windows
 Runtime through the bindings.
 
+A vtable slot is `{.mdslot.}` — `stdcall` and `raises: []` — so a `=destroy`
+hook can release through one, and a Nim proc filling one cannot let an
+exception escape into its caller.
+
 ### `winmdyaml` — winmd YAML dumper
 
 Prints a YAML representation of the contents in a `.winmd` file:

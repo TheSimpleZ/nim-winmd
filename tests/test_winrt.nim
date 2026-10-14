@@ -70,32 +70,32 @@ doAssert "    TotalBytesToSend*: ptr IReference[uint64]\n" in nsCode("web_http")
 # a vtable: its base, its slots, the return as a trailing `retval`
 doAssert """
   IStringableVtbl* {.mdvtbl.} = object of IInspectableVtbl
-    ToString*: proc(this: ptr IStringable, retval: ptr HSTRING): HRESULT {.stdcall.}
+    ToString*: proc(this: ptr IStringable, retval: ptr HSTRING): HRESULT {.mdslot.}
 """ in
   foundation
 doAssert """
   AsyncActionCompletedHandlerVtbl* {.mdvtbl.} = object of IUnknownVtbl
-    Invoke*: proc(this: ptr AsyncActionCompletedHandler, asyncInfo: ptr IAsyncAction, asyncStatus: AsyncStatus): HRESULT {.stdcall.}
+    Invoke*: proc(this: ptr AsyncActionCompletedHandler, asyncInfo: ptr IAsyncAction, asyncStatus: AsyncStatus): HRESULT {.mdslot.}
 """ in
   foundation
 # an array passed in: size and pointer
-doAssert "    CreateInt32Array*: proc(this: ptr IPropertyValueStatics, valueSize: uint32, value: ptr int32, retval: ptr ptr IInspectable): HRESULT {.stdcall.}\n" in
+doAssert "    CreateInt32Array*: proc(this: ptr IPropertyValueStatics, valueSize: uint32, value: ptr int32, retval: ptr ptr IInspectable): HRESULT {.mdslot.}\n" in
   foundation
 # an array the callee allocates: size and pointer, both by pointer
-doAssert "    GetInt32Array*: proc(this: ptr IPropertyValue, valueSize: ptr uint32, value: ptr ptr int32): HRESULT {.stdcall.}\n" in
+doAssert "    GetInt32Array*: proc(this: ptr IPropertyValue, valueSize: ptr uint32, value: ptr ptr int32): HRESULT {.mdslot.}\n" in
   foundation
-doAssert "    GetInputEntities*: proc(this: ptr IActionInvocationContext, retvalSize: ptr uint32, retval: ptr ptr ptr NamedActionEntity): HRESULT {.stdcall.}\n" in
+doAssert "    GetInputEntities*: proc(this: ptr IActionInvocationContext, retvalSize: ptr uint32, retval: ptr ptr ptr NamedActionEntity): HRESULT {.mdslot.}\n" in
   nsCode("ai_actions")
 # a generic interface's slots use its parameters
-doAssert "    GetAt*: proc(this: ptr IVector[T], index: uint32, retval: ptr T): HRESULT {.stdcall.}\n" in
+doAssert "    GetAt*: proc(this: ptr IVector[T], index: uint32, retval: ptr T): HRESULT {.mdslot.}\n" in
   collections
 # an IID, from the GuidAttribute
 doAssert "  IID_IStringable*: GUID = guid\"96369f54-8eb6-48f0-abce-c1b211e627c3\"\n" in
   foundation
 # overloads are named by OverloadAttribute
 doAssert """
-    MonthAsFullString*: proc(this: ptr ICalendar, retval: ptr HSTRING): HRESULT {.stdcall.}
-    MonthAsString*: proc(this: ptr ICalendar, idealLength: int32, retval: ptr HSTRING): HRESULT {.stdcall.}
+    MonthAsFullString*: proc(this: ptr ICalendar, retval: ptr HSTRING): HRESULT {.mdslot.}
+    MonthAsString*: proc(this: ptr ICalendar, idealLength: int32, retval: ptr HSTRING): HRESULT {.mdslot.}
 """ in
   nsCode("globalization")
 

@@ -6,6 +6,7 @@ import std/strutils
 {.pragma: mdvtbl, pure, inheritable.}
 {.pragma: mdalias.}
 {.pragma: mdinterface.}
+{.pragma: mdslot, stdcall, raises: [].}
 
 type
   GUID* {.mdtype.} = object
@@ -25,19 +26,19 @@ type
 
   IUnknownVtbl* {.mdvtbl.} = object
     QueryInterface*:
-      proc(this: pointer, riid: ptr GUID, ppvObject: ptr pointer): HRESULT {.stdcall.}
-    AddRef*: proc(this: pointer): uint32 {.stdcall.}
-    Release*: proc(this: pointer): uint32 {.stdcall.}
+      proc(this: pointer, riid: ptr GUID, ppvObject: ptr pointer): HRESULT {.mdslot.}
+    AddRef*: proc(this: pointer): uint32 {.mdslot.}
+    Release*: proc(this: pointer): uint32 {.mdslot.}
 
   IUnknown* {.mdinterface.} = object
     lpVtbl*: ptr IUnknownVtbl
 
   IInspectableVtbl* {.mdvtbl.} = object of IUnknownVtbl
     GetIids*:
-      proc(this: pointer, iidCount: ptr uint32, iids: ptr ptr GUID): HRESULT {.stdcall.}
+      proc(this: pointer, iidCount: ptr uint32, iids: ptr ptr GUID): HRESULT {.mdslot.}
     GetRuntimeClassName*:
-      proc(this: pointer, className: ptr HSTRING): HRESULT {.stdcall.}
-    GetTrustLevel*: proc(this: pointer, trustLevel: ptr TrustLevel): HRESULT {.stdcall.}
+      proc(this: pointer, className: ptr HSTRING): HRESULT {.mdslot.}
+    GetTrustLevel*: proc(this: pointer, trustLevel: ptr TrustLevel): HRESULT {.mdslot.}
 
   IInspectable* {.mdinterface.} = object
     lpVtbl*: ptr IInspectableVtbl

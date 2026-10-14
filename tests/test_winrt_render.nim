@@ -193,12 +193,13 @@ export winrtbase, winrttypes
 {.pragma: mdalias.}
 {.pragma: mdinterface.}
 {.pragma: mdvtbl, pure, inheritable.}
+{.pragma: mdslot, stdcall, raises: [].}
 
 type
   IVector*[T] {.mdinterface.} = object
     lpVtbl*: ptr IVectorVtbl[T]
   IVectorVtbl*[T] {.mdvtbl.} = object of IInspectableVtbl
-    GetAt*: proc(this: ptr IVector[T], index: uint32, retval: ptr T): HRESULT {.stdcall.}
+    GetAt*: proc(this: ptr IVector[T], index: uint32, retval: ptr T): HRESULT {.mdslot.}
   IStringable* {.mdinterface.} = object
     lpVtbl*: ptr IStringableVtbl
   AsyncActionCompletedHandler* {.mdinterface.} = object
@@ -207,10 +208,10 @@ type
   Launcher* {.mdinterface.} = object
     lpVtbl*: pointer
   IStringableVtbl* {.mdvtbl.} = object of IInspectableVtbl
-    ToString*: proc(this: ptr IStringable, retval: ptr HSTRING): HRESULT {.stdcall.}
+    ToString*: proc(this: ptr IStringable, retval: ptr HSTRING): HRESULT {.mdslot.}
     Unspellable*: pointer # signature not mapped
   AsyncActionCompletedHandlerVtbl* {.mdvtbl.} = object of IUnknownVtbl
-    Invoke*: proc(this: ptr AsyncActionCompletedHandler, asyncStatus: AsyncStatus): HRESULT {.stdcall.}
+    Invoke*: proc(this: ptr AsyncActionCompletedHandler, asyncStatus: AsyncStatus): HRESULT {.mdslot.}
 
 const
   IID_IStringable*: GUID = guid"96369f54-8eb6-48f0-abce-c1b211e627c3"
