@@ -88,6 +88,19 @@ type
   Plan* = object ## What the output is rendered from.
     modules*: seq[Module]
     instantiationIids*: seq[tuple[name: string, iid: Guid]]
+    base*: string
+      ## where winrtbase is: "" for one of this output's own, or the path of a
+      ## reference's modules, whose winrtbase every binding over it shares
+    qualified*: seq[tuple[alias, path: string]]
+      ## the references, each imported qualified: `from winrt/abi/winrttypes as
+      ## winrt import nil`, its types spelled `winrt.Point`
+
+  Reference* = object
+    ## A binding written before this one, whose types this one names rather
+    ## than declares: the Windows SDK's, beneath the Windows App SDK's.
+    alias*: string # what it is imported as: `winrt`
+    path*: string # where its modules are: `winrt/abi`
+    model*: Model # the metadata it was written from
 
 const remapped* = {
   "System.Guid": (name: "GUID", isObject: false, signature: "g16"),

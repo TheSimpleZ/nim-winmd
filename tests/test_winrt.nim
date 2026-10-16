@@ -116,4 +116,34 @@ for (name, iid) in [
 ]:
   doAssert &"  IID_{name}*: GUID = guid\"{iid}\"\n" in code["winrtgenerics"]
 
+# --- over a reference ---
+# Windows.Foundation's types as a binding written before, and the rest over
+# it: its types named through the alias, not declared again
+let whole = model.build(wa)
+let (below, above) = (
+  Model(types: whole.types.filterIt(it.ns.startsWith "Windows.Foundation")),
+  Model(types: whole.types.filterIt(not it.ns.startsWith "Windows.Foundation")),
+)
+let over = generateWinrtModules(
+    above, @[Reference(alias: "winrt", path: "winrt/abi", model: below)]
+  )
+  .mapIt((it.name, it.code)).toTable
+doAssert "winrtbase" notin over and "foundation" notin over
+for c in over.values:
+  doAssert "not mapped" notin c
+  doAssert "import winrt/abi/winrtbase\n" in c
+let overTypes = over["winrttypes"]
+doAssert "  IStringable* {.mdinterface.}" notin overTypes
+doAssert "  StorageFile* {.mdalias.} = IStorageFile\n" in overTypes
+doAssert "from winrt/abi/winrttypes as winrt import nil\n" in overTypes
+# the reference's types, as its own output names them
+doAssert "retval: ptr ptr winrt.IAsyncAction" in over["storage"]
+doAssert "retval: ptr ptr winrt.IAsyncOperation[ptr StorageFile]" in over["storage"]
+# an instantiation naming one of this output's types is this output's IID;
+# one naming only the reference's is the reference's
+let overIids = over["winrtgenerics"]
+doAssert "  IID_AsyncOperationCompletedHandler_StorageFile*: GUID = " &
+  "guid\"e521c894-2c26-5946-9e61-2b5e188d01ed\"\n" in overIids
+doAssert "IID_IVector_HSTRING*" notin overIids
+
 echo "test_winrt: all assertions passed"

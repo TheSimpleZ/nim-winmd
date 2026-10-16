@@ -163,10 +163,9 @@ static:
       Data4: [0xc0'u8, 0xff, 0xee, 0x64, 0xca, 0x8f, 0x5b, 0x90],
     )
 var handlerVtbl: MapChangedEventHandlerVtbl[HSTRING, ptr IInspectable]
-var handler =
-  MapChangedEventHandler[HSTRING, ptr IInspectable](
-    lpVtbl: cast[ptr IUnknownVtbl](addr handlerVtbl)
-  )
+var handler = MapChangedEventHandler[HSTRING, ptr IInspectable](
+  lpVtbl: cast[ptr IUnknownVtbl](addr handlerVtbl)
+)
 var handlerRefs: uint32
 var changes: seq[(string, CollectionChange)]
 handlerVtbl.QueryInterface = proc(

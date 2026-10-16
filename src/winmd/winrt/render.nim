@@ -141,7 +141,34 @@ const
   slotPragma = "{.pragma: mdslot, stdcall, raises: [].}"
     ## a C function: raises nothing, so a `=destroy` can release through one
 
-func moduleFile(k: Module): string =
+func spells(body, alias: string): bool =
+  ## True if `body` names something through `alias`: `winrt.Point`.
+  let at = alias & "."
+  var i = body.find(at)
+  while i >= 0:
+    if i == 0 or body[i - 1] notin IdentChars:
+      return true
+    i = body.find(at, i + 1)
+
+func importsOf(p: Plan, imports: seq[string], body = ""): string =
+  ## The import and export of `imports`, this output's modules, and the
+  ## qualified import of each reference `body` names something through:
+  ## winrtbase is the first reference's when there is one.
+  var local = imports
+  var lines: seq[string]
+  if p.base.len > 0 and "winrtbase" in local:
+    local.keepItIf(it != "winrtbase")
+    lines.add fmt"import {p.base}/winrtbase"
+  if local.len > 0:
+    let names = local.join(", ")
+    lines.add fmt"import ./[{names}]"
+  lines.add "export " & imports.join(", ")
+  for (alias, path) in p.qualified:
+    if body.spells(alias):
+      lines.add fmt"from {path}/winrttypes as {alias} import nil"
+  lines(lines)
+
+func moduleFile(p: Plan, k: Module): string =
   ## winrttypes, or a namespace module. winrttypes declares every type and an
   ## enum's members; a namespace module, its vtables — parameterised ones
   ## first — its IIDs, its classes' names, and `vtbl` for each interface.
@@ -163,14 +190,12 @@ func moduleFile(k: Module): string =
         k.declarations.map(constDeclarations).concat,
         vtables.map(vtableAccessor),
       )
-  let imports = k.imports.join(", ")
-  fmt"""
-{header(k.name)}
-import ./[{imports}]
-export {imports}
-""" &
+  let body =
     paragraph(pragmas) & section("type", types) & section("const", consts) &
     paragraph(accessors)
+  fmt"""
+{header(k.name)}
+{importsOf(p, k.imports, body)}""" & body
 
 func genericsFile(p: Plan): string =
   ## winrtgenerics: the instantiations' IIDs, sorted.
@@ -179,14 +204,16 @@ func genericsFile(p: Plan): string =
     )
   fmt"""
 {header("winrtgenerics")}
-import ./winrtbase
-export winrtbase
-""" &
+{importsOf(Plan(base: p.base), @["winrtbase"])}""" &
     section("const", consts)
 
 func renderModules*(p: Plan): seq[GenModule] =
-  ## Every module's name and source.
-  @[
-    GenModule(name: "winrtbase", code: header("winrtbase") & "\n" & baseModule),
-    GenModule(name: "winrtgenerics", code: genericsFile(p)),
-  ] & p.modules.mapIt(GenModule(name: it.name, code: moduleFile(it)))
+  ## Every module's name and source. Over a reference, winrtbase is the
+  ## reference's, and not written again.
+  (
+    if p.base.len > 0:
+      @[]
+    else:
+      @[GenModule(name: "winrtbase", code: header("winrtbase") & "\n" & baseModule)]
+  ) & GenModule(name: "winrtgenerics", code: genericsFile(p)) &
+    p.modules.mapIt(GenModule(name: it.name, code: moduleFile(p, it)))

@@ -90,10 +90,17 @@ func substitute(t: SigType, args: seq[SigType]): SigType =
     result.inner = new(SigType)
     result.inner[] = substitute(t.inner[], args)
 
-func instantiations(n: Naming, m: Model): OrderedTable[string, SigType] =
-  ## Every instantiation the metadata uses or implies, by signature.
+func mentions(n: Naming, t: SigType, own: int): bool =
+  ## True if instantiation `t` names one of the first `own` types.
+  let i = n.indexOf(t)
+  (i.isSome and i.get < own) or t.args.anyIt(mentions(n, it, own)) or
+    (t.inner != nil and mentions(n, t.inner[], own))
+
+func instantiations(n: Naming, m: Model, own: int): OrderedTable[string, SigType] =
+  ## Every instantiation the first `own` types use or imply, by signature;
+  ## one naming none of them is a reference's to declare.
   var pending: seq[SigType]
-  for t in m.types:
+  for t in m.types[0 ..< own]:
     pending.add t.interfaces
     pending.add t.fields.mapIt(it.ty)
     for fn in t.methods:
@@ -111,7 +118,7 @@ func instantiations(n: Naming, m: Model): OrderedTable[string, SigType] =
         ""
       else:
         signature(n, m, t)
-    if sig.len == 0 or sig in result:
+    if sig.len == 0 or sig in result or not mentions(n, t, own):
       continue
     result[sig] = t
     let d = m.types[n.indexOf(t).get]
@@ -124,17 +131,20 @@ func argumentName(t: AbiType): string =
   ## `t` in an IID's name: `HSTRING`, `IKeyValuePair_HSTRING_HSTRING`.
   case t.kind
   of akNamed:
-    t.name
+    t.name.rsplit('.', 1)[^1] # a reference's, without its alias
   of akPointer:
     argumentName(t.target)
   of akInstantiation:
-    t.definition & "_" & t.args.map(argumentName).join("_")
+    t.definition.rsplit('.', 1)[^1] & "_" & t.args.map(argumentName).join("_")
   of akVoid, akArray:
     ""
 
-func instanceIids*(n: Naming, m: Model): seq[tuple[name: string, iid: Guid]] =
-  ## Every instantiation's IID and its name (`IID_IVector_HSTRING`).
+func instanceIids*(
+    n: Naming, m: Model, own = m.types.len
+): seq[tuple[name: string, iid: Guid]] =
+  ## The IID and name (`IID_IVector_HSTRING`) of every instantiation the
+  ## first `own` types of `m` use or imply.
   var taken = n.usedNames
-  for sig, t in instantiations(n, m):
+  for sig, t in instantiations(n, m, own):
     let name = argumentName(abiType(n, t, @[]).get)
     result.add (taken.freshIdent("IID_" & name), instanceIid(sig))

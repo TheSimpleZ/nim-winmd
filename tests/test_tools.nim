@@ -31,6 +31,30 @@ let winmd2nim = build("winmd2nim")
 let winrt = run(winmd2nim, winrtWinmd, dir / "winrt")
 doAssert winrt.exitCode == 0 and "note:" notin winrt.output, winrt.output
 
+# more than one winmd, over a binding of another: the reference's types are
+# named through its alias, and its winrtbase is not written again
+let over = run(
+  winmd2nim,
+  "--reference:winrt/abi=windows-rs/crates/libs/default/Windows.winmd",
+  components & "Microsoft.UI.winmd",
+  components & "Microsoft.Foundation.winmd",
+  dir / "over",
+)
+doAssert over.exitCode == 0, over.output
+doAssert not fileExists(dir / "over" / "winrtbase.nim")
+doAssert fileExists(dir / "over" / "microsoft_ui.nim")
+doAssert "import winrt/abi/winrtbase\n" in readFile(dir / "over" / "winrttypes.nim")
+
+# --reference is for WinRT metadata
+let win32Ref = run(
+  winmd2nim,
+  "--reference:winrt/abi=windows-rs/crates/libs/default/Windows.winmd",
+  "windows-rs/crates/libs/default/Windows.Win32.winmd",
+  dir / "w32",
+)
+doAssert win32Ref.exitCode == 1 and "is for WinRT metadata" in win32Ref.output,
+  win32Ref.output
+
 # the Win32 options are refused for WinRT, before anything is written
 for args in [
   @["--headers", winrtWinmd, dir / "headers"],
@@ -39,7 +63,7 @@ for args in [
 ]:
   let refused = run(winmd2nim, args)
   doAssert refused.exitCode == 1, refused.output
-  doAssert "are for Win32 metadata" in refused.output
+  doAssert "for Win32 metadata" in refused.output
   doAssert not dirExists(args[^2]) and not dirExists(args[^1])
 
 # --- winmd2yaml ---

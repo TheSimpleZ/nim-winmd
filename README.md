@@ -34,6 +34,7 @@ Reads a `.winmd` file and writes Nim modules covering its full API surface
 ```
 nim c -d:release src/winmd2nim.nim
 src/winmd2nim <input.winmd> <outdir> [symbol=module map file | rdl dir]
+src/winmd2nim [--reference:<path>=<winmd>]... <input.winmd>... <outdir>   # WinRT
 ```
 
 Arguments:
@@ -84,6 +85,24 @@ Runtime through the bindings.
 A vtable slot is `{.mdslot.}` — `stdcall` and `raises: []` — so a `=destroy`
 hook can release through one, and a Nim proc filling one cannot let an
 exception escape into its caller.
+
+WinRT metadata can come in more than one file, and be written over a binding
+of other metadata: the Windows App SDK's winmds (WinUI 3) refer to
+`Windows.winmd`'s types, which a binding of `Windows.winmd` already declares.
+`--reference:<path>=<winmd>` names that binding and the winmd it was written
+from; repeat it for each of its winmds.
+
+```
+winmd2nim --reference:winrt/abi=Windows.winmd Microsoft.*.winmd winui3/abi
+```
+
+The reference's types are not declared again. They are spelled through a
+qualified import of its `winrttypes`, aliased by the first segment of the
+path — `from winrt/abi/winrttypes as winrt import nil`, `ptr winrt.Uri` — in
+the modules that name one, and its `winrtbase` is the one imported, so an
+`IInspectable` is the same type in both. `winrtgenerics` holds the IIDs of the
+instantiations that name one of the new types; one of the reference's types
+alone (`IVector<HSTRING>`) is the reference's.
 
 ### `winmdyaml` — winmd YAML dumper
 

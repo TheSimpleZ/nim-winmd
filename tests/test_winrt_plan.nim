@@ -187,7 +187,9 @@ let placed = buildPlan(
   )
 )
 doAssert placed.modules.mapIt(it.name) == @["winrttypes", "a", "b"]
-doAssert placed.modules[0].declared == @["IThing", "IOther", "Holder", "Nested", "Plain"]
+doAssert placed.modules[0].declared == @[
+  "IThing", "IOther", "Holder", "Nested", "Plain"
+]
 doAssert placed.modules[1].declared == @["IThing"]
 doAssert placed.modules[2].declared == @["IOther"]
 # A and B refer to each other, and still import only the base modules
