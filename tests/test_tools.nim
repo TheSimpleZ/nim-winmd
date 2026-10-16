@@ -1,0 +1,85 @@
+# test_tools.nim — winmd2nim and winmd2yaml, built and run (doAssert-based).
+# Run: nim r --verbosity:0 tests/test_tools.nim  (or `nimble test`)
+
+import std/[os, osproc, strutils]
+
+const
+  components = "windows-rs/crates/tools/reactor/winmd/"
+  winrtWinmd = components & "Microsoft.Windows.System.Power.winmd"
+
+let dir = getTempDir() / "winmd_test_tools"
+removeDir(dir)
+createDir(dir)
+
+proc build(tool: string): string =
+  ## src/`tool`.nim built into the test's folder.
+  result = dir / tool.addFileExt(ExeExt)
+  let command =
+    [getCurrentCompilerExe(), "c", "--hints:off", "--verbosity:0", "-o:" & result]
+  let (output, code) = execCmdEx(quoteShellCommand(command) & " src/" & tool & ".nim")
+  doAssert code == 0, output
+
+proc run(exe: string, args: varargs[string]): tuple[output: string, exitCode: int] =
+  ## `exe` run with `args`: what it printed, and its exit code.
+  execCmdEx(quoteShellCommand(@[exe] & @args))
+
+# --- winmd2nim ---
+
+let winmd2nim = build("winmd2nim")
+
+# WinRT metadata: no word of the Win32 map
+let winrt = run(winmd2nim, winrtWinmd, dir / "winrt")
+doAssert winrt.exitCode == 0 and "note:" notin winrt.output, winrt.output
+
+# more than one winmd, over a binding of another: the reference's types are
+# named through its alias, and its winrtbase is not written again
+let over = run(
+  winmd2nim,
+  "--reference:winrt/abi=windows-rs/crates/libs/default/Windows.winmd",
+  components & "Microsoft.UI.winmd",
+  components & "Microsoft.Foundation.winmd",
+  dir / "over",
+)
+doAssert over.exitCode == 0, over.output
+doAssert not fileExists(dir / "over" / "winrtbase.nim")
+doAssert fileExists(dir / "over" / "microsoft_ui.nim")
+doAssert "import winrt/abi/winrtbase\n" in readFile(dir / "over" / "winrttypes.nim")
+
+# --reference is for WinRT metadata
+let win32Ref = run(
+  winmd2nim,
+  "--reference:winrt/abi=windows-rs/crates/libs/default/Windows.winmd",
+  "windows-rs/crates/libs/default/Windows.Win32.winmd",
+  dir / "w32",
+)
+doAssert win32Ref.exitCode == 1 and "is for WinRT metadata" in win32Ref.output,
+  win32Ref.output
+
+# the Win32 options are refused for WinRT, before anything is written
+for args in [
+  @["--headers", winrtWinmd, dir / "headers"],
+  @["--lowercase", winrtWinmd, dir / "lowercase"],
+  @[winrtWinmd, dir / "map", "data/type_headers.txt"],
+]:
+  let refused = run(winmd2nim, args)
+  doAssert refused.exitCode == 1, refused.output
+  doAssert "for Win32 metadata" in refused.output
+  doAssert not dirExists(args[^2]) and not dirExists(args[^1])
+
+# --- winmd2yaml ---
+
+# every signature is decoded
+let yaml = run(build("winmd2yaml"), components & "Microsoft.UI.winmd")
+doAssert yaml.exitCode == 0
+doAssert "undecoded" notin yaml.output
+for expected in [
+  "sig: \"void(Windows.Foundation.Collections.IVector`1<Microsoft.UI.Input.PointerPoint>)\"",
+  "name: \"IndexOf\", type: \"boolean(!0, byref U4)\"",
+  "type: \"Microsoft.UI.Input.NonClientRegionKind[]\"",
+  "{name: \"AliceBlue\", flags: 0000, type: \"Windows.UI.Color\"}",
+  "{type: \"Windows.Foundation.Collections.IIterable`1<Microsoft.UI.Composition.CompositionAnimation>\"}",
+]:
+  doAssert expected in yaml.output, expected
+
+removeDir(dir)
+echo "test_tools: all assertions passed"

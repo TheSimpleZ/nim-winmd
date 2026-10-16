@@ -817,9 +817,11 @@ doAssert "LPFINDREPLACE*" notin commdlgmod.code
 # name under a `when defined(...)` block (narrowest arch set first), not
 # two declarations with a `_2` suffix
 doAssert "when defined(i386):" in ioapisetmod.code
-doAssert "  proc GetQueuedCompletionStatus*(CompletionPort: HANDLE, lpNumberOfBytesTransferred: ptr uint32, lpCompletionKey: ptr uint32, lpOverlapped: ptr LPOVERLAPPED, dwMilliseconds: uint32): BOOL {.mdmethod, importc, stdcall.}" in ioapisetmod.code
+doAssert "  proc GetQueuedCompletionStatus*(CompletionPort: HANDLE, lpNumberOfBytesTransferred: ptr uint32, lpCompletionKey: ptr uint32, lpOverlapped: ptr LPOVERLAPPED, dwMilliseconds: uint32): BOOL {.mdmethod, importc, stdcall.}" in
+  ioapisetmod.code
 doAssert "elif defined(amd64) or defined(arm64):" in ioapisetmod.code
-doAssert "  proc GetQueuedCompletionStatus*(CompletionPort: HANDLE, lpNumberOfBytesTransferred: ptr uint32, lpCompletionKey: ptr uint64, lpOverlapped: ptr LPOVERLAPPED, dwMilliseconds: uint32): BOOL {.mdmethod, importc, stdcall.}" in ioapisetmod.code
+doAssert "  proc GetQueuedCompletionStatus*(CompletionPort: HANDLE, lpNumberOfBytesTransferred: ptr uint32, lpCompletionKey: ptr uint64, lpOverlapped: ptr LPOVERLAPPED, dwMilliseconds: uint32): BOOL {.mdmethod, importc, stdcall.}" in
+  ioapisetmod.code
 doAssert "GetQueuedCompletionStatus_2" notin ioapisetmod.code
 # MSIDBOPEN_* are integers stored in a pointer-typed (LPCTSTR) constant:
 # the declared type is kept and the value is cast explicitly; the VM
@@ -911,7 +913,8 @@ doAssert "when defined(checkAbi) or defined(mdheaders):" in hwindef.code
 doAssert "  {.pragma: mdheader, header: \"windef.h\".}" in hwindef.code
 doAssert "  {.pragma: mdheader.}" in hwindef.code
 doAssert "mdmethod" notin hwindef.code
-doAssert "{.pragma: mdtype, pure, inheritable, completeStruct, mdheader.}" in hwindef.code
+doAssert "{.pragma: mdtype, pure, inheritable, completeStruct, mdheader.}" in
+  hwindef.code
 doAssert "{.pragma: mdalias, mdheader.}" in hwindef.code
 doAssert "POINT* {.mdtype.} = object" in hwindef.code
 # winuser has functions: mdmethod also includes mdheader

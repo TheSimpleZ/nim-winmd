@@ -34,20 +34,21 @@ Reads a `.winmd` file and writes Nim modules covering its full API surface
 ```
 nim c -d:release src/winmd2nim.nim
 src/winmd2nim <input.winmd> <outdir> [symbol=module map file | rdl dir]
+src/winmd2nim [--reference:<path>=<winmd>]... <input.winmd>... <outdir>   # WinRT
 ```
 
 Arguments:
 
 * `<input.winmd>` — the metadata file, e.g. `Windows.Win32.winmd`
 * `<outdir>` — output directory (created if missing)
-* optional third argument — symbol-to-module map:
+* optional third argument (Win32 only) — symbol-to-module map:
   * a text file of `symbol=module` lines (default: `type_headers.txt`), or
   * a directory containing the per-header RDL snapshot the winmd was built
     from (e.g. the `metadata/` directory of the `windows-rs` project); the
     declared names in the `.rdl` files are read directly and produce the same
     mapping as `type_headers.txt` file
 
-Output layout:
+Output layout for Win32 metadata:
 
 * `win32base.nim` — shared types without header provenance (only when non-empty)
 * `<mapped_name>.nim` — names taken from name mapping file
@@ -56,6 +57,52 @@ Output layout:
 The name mapping file, or equivalently the `.rdl` files, assign names to specific
 Nim modules based on the header they originated from instead of relying on
 namespace and dll name found in the .winmd file.
+
+For WinRT metadata (`Windows.winmd`), it writes the Windows Runtime ABI
+instead:
+
+* `winrtbase.nim` — `GUID`, `HRESULT`, `HSTRING`, `IUnknown`, `IInspectable`
+* `winrttypes.nim` — every type: enums, structs, interfaces and delegates,
+  and runtime classes
+* `winrtgenerics.nim` — IIDs of generic instantiations (`IID_IVector_HSTRING`)
+* `<namespace>.nim` — the vtables and IIDs of the namespace's interfaces and
+  delegates, and the names of its runtime classes, named without the
+  `Windows.` prefix (`foundation.nim`, `ui_xaml.nim`)
+
+An interface in `winrttypes` is the object a pointer to it points at, whose
+`lpVtbl` is the base vtable: `IUnknown`'s and `IInspectable`'s methods are
+called through it as they are. Its own methods are its namespace's vtable,
+which `this.vtbl` gives — `uri.vtbl.get_Host(uri, addr host)`. A vtable names
+only types from `winrttypes`, so a namespace module imports nothing else, and
+namespaces that refer to each other (`Windows.Storage` and `Windows.System`)
+cost no more than any two. An enum is written as an unscoped Win32 enum: its
+integer, and a const per member.
+
+Use the SDK's union metadata or the windows-rs copy: types from other winmds
+become bare `pointer`s. See `tests/winrtcheck.nim` for calling the Windows
+Runtime through the bindings.
+
+A vtable slot is `{.mdslot.}` — `stdcall` and `raises: []` — so a `=destroy`
+hook can release through one, and a Nim proc filling one cannot let an
+exception escape into its caller.
+
+WinRT metadata can come in more than one file, and be written over a binding
+of other metadata: the Windows App SDK's winmds (WinUI 3) refer to
+`Windows.winmd`'s types, which a binding of `Windows.winmd` already declares.
+`--reference:<path>=<winmd>` names that binding and the winmd it was written
+from; repeat it for each of its winmds.
+
+```
+winmd2nim --reference:winrt/abi=Windows.winmd Microsoft.*.winmd winui3/abi
+```
+
+The reference's types are not declared again. They are spelled through a
+qualified import of its `winrttypes`, aliased by the first segment of the
+path — `from winrt/abi/winrttypes as winrt import nil`, `ptr winrt.Uri` — in
+the modules that name one, and its `winrtbase` is the one imported, so an
+`IInspectable` is the same type in both. `winrtgenerics` holds the IIDs of the
+instantiations that name one of the new types; one of the reference's types
+alone (`IVector<HSTRING>`) is the reference's.
 
 ### `winmdyaml` — winmd YAML dumper
 
@@ -78,6 +125,13 @@ The repository has nimble tasks (`nimble tasks`):
   (writing a `SOURCE.env` with git provenance tags); the bindings are
   generated with `--headers` by default, and extra `winmd2nim` flags
   (e.g. `--lowercase`) go in the `WINMDFLAGS` environment variable
+* `nimble winrtabi` — generate the WinRT bindings into `../nim-winrt-abi`
+* `nimble winrtcheck` — generate them and call the Windows Runtime through
+  them (Windows only)
+* `nimble winrtfull` — generate them and compile every module
+
+The winrt tasks read windows-rs's `Windows.winmd`, or the file `WINRT_WINMD`
+names.
 
 The tests and the tools use the `windows-rs` git submodule at the repo
 root (the winmd and the per-header RDL snapshot); the `winmd2nim` /
