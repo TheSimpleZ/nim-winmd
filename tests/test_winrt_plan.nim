@@ -171,20 +171,28 @@ doAssert hresult.declarationOf("Status").fields[0].ty.name == "HRESULT"
 
 # --- where it is declared ---
 
-# structs that mention an interface, or such a struct, move
-let moved = buildPlan(
+# winrttypes declares every type, structs that mention an interface included;
+# a namespace module holds its interfaces' vtables, and imports no other
+var other = interfaceType("IOther", @[fn("Get", named("A", "IThing"))])
+other.ns = "B"
+let placed = buildPlan(
   Model(
     types: @[
-      interfaceType("IThing"),
+      interfaceType("IThing", @[fn("Get", named("B", "IOther"))]),
+      other,
       structType("Holder", named("A", "IThing")),
       structType("Nested", named("A", "Holder")),
       structType("Plain", prim(pvI4)),
     ]
   )
 )
-doAssert moved.modules.mapIt(it.name) == @["winrttypes", "a"]
-doAssert moved.modules[0].declared == @["Plain"]
-doAssert moved.modules[1].declared == @["IThing", "Holder", "Nested"]
+doAssert placed.modules.mapIt(it.name) == @["winrttypes", "a", "b"]
+doAssert placed.modules[0].declared == @["IThing", "IOther", "Holder", "Nested", "Plain"]
+doAssert placed.modules[1].declared == @["IThing"]
+doAssert placed.modules[2].declared == @["IOther"]
+# A and B refer to each other, and still import only the base modules
+doAssert placed.modules[1].imports == @["winrtbase", "winrttypes"]
+doAssert placed.modules[2].imports == @["winrtbase", "winrttypes"]
 
 # --- instantiations ---
 

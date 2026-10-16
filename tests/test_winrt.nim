@@ -33,40 +33,40 @@ let code = generateWinrtModules(model.build(wa)).mapIt((it.name, it.code)).toTab
 for c in code.values:
   doAssert "not mapped" notin c
 
-proc nsCode(name: string): string =
-  ## The code of namespace module `name`, or of the group it re-exports.
-  result = code[name]
-  for line in result.splitLines:
-    if line.startsWith("import ./") and line.endsWith("_group"):
-      return code[line["import ./".len .. ^1]]
-
-# winrttypes: the enums and structs
+# winrttypes: every type
 let types = code["winrttypes"]
-# an enum is a distinct integer, with consts and borrowed operations
-doAssert "  AsyncStatus* = distinct int32\n" in types
-doAssert "  AsyncStatus_Started*: AsyncStatus = AsyncStatus(0'i32)\n" in types
-doAssert "func `or`*(a, b: AsyncStatus)" notin types
-doAssert "  FileAttributes* = distinct uint32\n" in types
-doAssert "  FileAttributes_ReadOnly*: FileAttributes = FileAttributes(1'u32)\n" in types
-doAssert "func `or`*(a, b: FileAttributes): FileAttributes {.borrow.}\n" in types
+# an enum is an unscoped Win32 enum: its integer, and a const per member
+doAssert "  AsyncStatus* {.mdalias.} = int32\n" in types
+doAssert "  AsyncStatus_Started*: AsyncStatus = 0'i32\n" in types
+doAssert "  FileAttributes* {.mdalias.} = uint32\n" in types
+doAssert "  FileAttributes_ReadOnly*: FileAttributes = 1'u32\n" in types
+doAssert "{.borrow.}" notin types
 # a renamed enum's members follow its name
-doAssert "  PackageStatus_2_OK*: PackageStatus_2 = PackageStatus_2(0'u32)\n" in types
+doAssert "  PackageStatus_2_OK*: PackageStatus_2 = 0'u32\n" in types
 doAssert "  Point* {.mdtype.} = object\n    X*: float32\n    Y*: float32\n" in types
-
+# an interface is the object a pointer to it points at; its vtable is its
+# namespace's, and the base one is reachable without a cast
+doAssert "  IStringable* {.mdinterface.} = object\n    lpVtbl*: ptr IInspectableVtbl\n" in
+  types
+doAssert "  AsyncActionCompletedHandler* {.mdinterface.} = object\n    lpVtbl*: ptr IUnknownVtbl\n" in
+  types
+doAssert "  IVector*[T] {.mdinterface.} = object\n    lpVtbl*: ptr IInspectableVtbl\n" in
+  types
 # a runtime class is its default interface
-let foundation = code["foundation"]
-doAssert "  Uri* {.mdalias.} = IUriRuntimeClass\n" in foundation
-let collections = nsCode("foundation_collections")
-doAssert "  StringMap* {.mdalias.} = IMap[HSTRING, HSTRING]\n" in collections
+doAssert "  Uri* {.mdalias.} = IUriRuntimeClass\n" in types
+doAssert "  StringMap* {.mdalias.} = IMap[HSTRING, HSTRING]\n" in types
+# a struct that mentions an interface is declared with the rest
+doAssert "  HttpProgress* {.mdtype.} = object\n" in types
+doAssert "    TotalBytesToSend*: ptr IReference[uint64]\n" in types
 
-# Windows.Storage and Windows.System form a cycle: they share a module
-doAssert code["storage"].splitLines.anyIt(
-  it.startsWith("import ./") and it.endsWith("_group")
-)
-doAssert nsCode("storage") == nsCode("system")
-# a struct that mentions an interface moves beside it
-doAssert "  HttpProgress* {.mdtype.} = object\n" in nsCode("web_http")
-doAssert "    TotalBytesToSend*: ptr IReference[uint64]\n" in nsCode("web_http")
+# a namespace module imports only winrtbase and winrttypes, so namespaces
+# that refer to each other in a cycle — Storage and System — need nothing more
+for name in ["storage", "system", "foundation"]:
+  doAssert "import ./[winrtbase, winrttypes]\n" in code[name]
+let foundation = code["foundation"]
+let collections = code["foundation_collections"]
+doAssert "  RuntimeClass_Windows_Foundation_Uri*: string = \"Windows.Foundation.Uri\"\n" in
+  foundation
 # a vtable: its base, its slots, the return as a trailing `retval`
 doAssert """
   IStringableVtbl* {.mdvtbl.} = object of IInspectableVtbl
@@ -85,7 +85,7 @@ doAssert "    CreateInt32Array*: proc(this: ptr IPropertyValueStatics, valueSize
 doAssert "    GetInt32Array*: proc(this: ptr IPropertyValue, valueSize: ptr uint32, value: ptr ptr int32): HRESULT {.mdslot.}\n" in
   foundation
 doAssert "    GetInputEntities*: proc(this: ptr IActionInvocationContext, retvalSize: ptr uint32, retval: ptr ptr ptr NamedActionEntity): HRESULT {.mdslot.}\n" in
-  nsCode("ai_actions")
+  code["ai_actions"]
 # a generic interface's slots use its parameters
 doAssert "    GetAt*: proc(this: ptr IVector[T], index: uint32, retval: ptr T): HRESULT {.mdslot.}\n" in
   collections
@@ -97,7 +97,7 @@ doAssert """
     MonthAsFullString*: proc(this: ptr ICalendar, retval: ptr HSTRING): HRESULT {.mdslot.}
     MonthAsString*: proc(this: ptr ICalendar, idealLength: int32, retval: ptr HSTRING): HRESULT {.mdslot.}
 """ in
-  nsCode("globalization")
+  code["globalization"]
 
 # instantiation IIDs, including ones only their definitions imply
 for (name, iid) in [

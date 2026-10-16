@@ -75,9 +75,8 @@ type
       defaultInterface*: Option[AbiType] # none for a static class
 
   ModuleKind* = enum
-    mkTypes ## winrttypes
-    mkNamespace ## a namespace, or the namespaces of a cycle
-    mkShim ## a namespace of a cycle: re-exports the shared module
+    mkTypes ## winrttypes: every type
+    mkNamespace ## a namespace: its vtables, IIDs and class names
 
   Module* = object ## A module to write (but winrtbase and winrtgenerics).
     kind*: ModuleKind
@@ -138,118 +137,33 @@ func enumMembers(t: ModelType, name: string): seq[EnumMember] =
 # which module declares what
 # ---------------------------------------------------------------------------
 
-func inNamespaceModule(t: ModelType, isMoved: bool): bool =
-  ## True unless `t` goes in winrttypes.
-  t.kind in {tkInterface, tkDelegate} or isMoved
-
-func refNamespaces(n: Naming, moved: HashSet[int], t: SigType): HashSet[string] =
-  ## The namespaces of the namespace-module types `t` mentions.
-  case t.base
-  of bNamed:
-    let i = n.indexOf(t)
-    if i.isSome and (n.names[i.get].isObject or i.get in moved):
-      result.incl t.ns
-  of bGenericInst:
-    if n.indexOf(t).isSome:
-      result.incl t.ns
-    for a in t.args:
-      result.incl refNamespaces(n, moved, a)
-  of bPtr, bByRef, bArray, bSzArray:
-    result = refNamespaces(n, moved, t.inner[])
-  of bPrim, bTypeVar:
-    discard
-
-func refNamespaces(n: Naming, moved: HashSet[int], t: ModelType): HashSet[string] =
-  ## The other namespaces the declaration of `t` needs.
-  if t.defaultInterface.isSome:
-    result.incl refNamespaces(n, moved, t.defaultInterface.get)
-  for f in t.fields:
-    result.incl refNamespaces(n, moved, f.ty)
-  for fn in t.methods:
-    result.incl refNamespaces(n, moved, fn.ret)
-    for prm in fn.params:
-      result.incl refNamespaces(n, moved, prm.ty)
-  result.excl t.ns
-
-func movedStructs(n: Naming, m: Model): HashSet[int] =
-  ## Structs that mention an interface, or a moved struct: they move out of
-  ## winrttypes.
-  var changed = true
-  while changed:
-    changed = false
-    for i, t in m.types:
-      if t.kind == tkStruct and i notin result and
-          t.fields.anyIt(refNamespaces(n, result, it.ty).len > 0):
-        result.incl i
-        changed = true
-
-func namespaceEdges(
-    n: Naming, m: Model, moved: HashSet[int]
-): Table[string, HashSet[string]] =
-  ## Each namespace module's namespace -> the namespaces it needs.
-  for i, t in m.types:
-    if inNamespaceModule(t, i in moved):
-      result.mgetOrPut(t.ns, initHashSet[string]()).incl refNamespaces(n, moved, t)
-
-func reachable(edges: Table[string, HashSet[string]], start: string): HashSet[string] =
-  ## The namespaces `start` needs, directly or not.
-  var pending = toSeq(edges.getOrDefault(start))
-  while pending.len > 0:
-    let ns = pending.pop()
-    if ns notin result:
-      result.incl ns
-      pending.add toSeq(edges.getOrDefault(ns))
-
-func cycles(edges: Table[string, HashSet[string]]): seq[seq[string]] =
-  ## The namespaces grouped by mutual reach, sorted; Nim modules cannot import
-  ## each other, so a group shares a module.
-  let namespaces = sorted(toSeq(edges.keys))
-  let reach = namespaces.mapIt((it, reachable(edges, it))).toTable
-  var placed: HashSet[string]
-  for ns in namespaces:
-    if ns notin placed:
-      let group = namespaces.filterIt(it == ns or (it in reach[ns] and ns in reach[it]))
-      placed.incl group.toHashSet
-      result.add group
-
 func placeModules*(n: Naming, m: Model, declarations: seq[Declaration]): seq[Module] =
-  ## winrttypes, then each group's module and its shims; `declarations` has one
-  ## entry per m.types.
-  let moved = movedStructs(n, m)
-  let edges = namespaceEdges(n, m, moved)
-  let groups = cycles(edges)
-  var groupOf: Table[string, int]
-  for g, namespaces in groups:
-    for ns in namespaces:
-      groupOf[ns] = g
+  ## winrttypes, which declares every type, then a module per namespace with
+  ## its interfaces' vtables and IIDs and its classes' names; `declarations`
+  ## has one entry per m.types.
+  ##
+  ## An interface is declared in winrttypes, beside every enum and struct, as
+  ## the object a pointer to it points at. A vtable then names only types from
+  ## winrttypes, so no namespace module imports another, and a namespace that
+  ## refers to another in a cycle — Windows.Storage and Windows.System do —
+  ## costs nothing.
   var types = Module(kind: mkTypes, name: "winrttypes", imports: @["winrtbase"])
-  var spaces = groups.mapIt(
-    Module(
-      kind: mkNamespace,
-      name: moduleName(it[0]) & (if it.len > 1: "_group" else: ""),
-      namespaces: it,
-    )
-  )
+  var spaces: Table[string, Module]
   for i, t in m.types:
-    if inNamespaceModule(t, i in moved):
-      spaces[groupOf[t.ns]].declarations.add declarations[i]
-    elif t.kind in {tkEnum, tkUnscopedEnum, tkStruct}:
-      types.declarations.add declarations[i]
-  let names = spaces.mapIt(it.name)
-  for g in 0 ..< spaces.len:
-    let refs = spaces[g].namespaces.mapIt(toSeq(edges[it])).concat.mapIt(groupOf[it])
-    let deps = refs.filterIt(it != g).sorted.deduplicate(isSorted = true)
-    spaces[g].imports = @["winrtbase", "winrttypes"] & deps.mapIt(names[it])
-
-  result.add types
-  for space in spaces:
-    result.add space
-    if space.namespaces.len > 1:
-      result.add space.namespaces.mapIt(
+    types.declarations.add declarations[i]
+    if t.kind in {tkInterface, tkDelegate}:
+      spaces.mgetOrPut(
+        t.ns,
         Module(
-          kind: mkShim, name: moduleName(it), namespaces: @[it], imports: @[space.name]
-        )
-      )
+          kind: mkNamespace,
+          name: moduleName(t.ns),
+          namespaces: @[t.ns],
+          imports: @["winrtbase", "winrttypes"],
+        ),
+      ).declarations.add declarations[i]
+  result.add types
+  for ns in sorted(toSeq(spaces.keys)):
+    result.add spaces[ns]
 
 # ---------------------------------------------------------------------------
 # what each type is called

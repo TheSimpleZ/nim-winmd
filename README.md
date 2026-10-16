@@ -61,10 +61,21 @@ For WinRT metadata (`Windows.winmd`), it writes the Windows Runtime ABI
 instead:
 
 * `winrtbase.nim` — `GUID`, `HRESULT`, `HSTRING`, `IUnknown`, `IInspectable`
-* `winrttypes.nim` — enums and structs
+* `winrttypes.nim` — every type: enums, structs, interfaces and delegates,
+  and runtime classes
 * `winrtgenerics.nim` — IIDs of generic instantiations (`IID_IVector_HSTRING`)
-* `<namespace>.nim` — interfaces, delegates and runtime classes, named
-  without the `Windows.` prefix (`foundation.nim`, `ui_xaml.nim`)
+* `<namespace>.nim` — the vtables and IIDs of the namespace's interfaces and
+  delegates, and the names of its runtime classes, named without the
+  `Windows.` prefix (`foundation.nim`, `ui_xaml.nim`)
+
+An interface in `winrttypes` is the object a pointer to it points at, whose
+`lpVtbl` is the base vtable: `IUnknown`'s and `IInspectable`'s methods are
+called through it as they are. Its own methods are its namespace's vtable,
+which `this.vtbl` gives — `uri.vtbl.get_Host(uri, addr host)`. A vtable names
+only types from `winrttypes`, so a namespace module imports nothing else, and
+namespaces that refer to each other (`Windows.Storage` and `Windows.System`)
+cost no more than any two. An enum is written as an unscoped Win32 enum: its
+integer, and a const per member.
 
 Use the SDK's union metadata or the windows-rs copy: types from other winmds
 become bare `pointer`s. See `tests/winrtcheck.nim` for calling the Windows

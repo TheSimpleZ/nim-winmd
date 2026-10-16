@@ -73,10 +73,10 @@ let uriFactory = activationFactory[IUriRuntimeClassFactory](
 var uri: ptr Uri
 let url = "https://nim-lang.org/docs/?a=1&b=two"
 let urlString = toHstring(url)
-check uriFactory.lpVtbl.CreateUri(uriFactory, urlString, addr uri)
+check uriFactory.vtbl.CreateUri(uriFactory, urlString, addr uri)
 discard WindowsDeleteString(urlString)
 var s: HSTRING
-check uri.lpVtbl.get_Host(uri, addr s)
+check uri.vtbl.get_Host(uri, addr s)
 doAssert take(s) == "nim-lang.org"
 check uri.lpVtbl.GetRuntimeClassName(uri, addr s)
 doAssert take(s) == RuntimeClass_Windows_Foundation_Uri
@@ -84,13 +84,13 @@ var trust: TrustLevel # a distinct integer, as an enum of the metadata
 check uri.lpVtbl.GetTrustLevel(uri, addr trust)
 doAssert trust in [TrustLevel_BaseTrust, TrustLevel_PartialTrust, TrustLevel_FullTrust]
 var decoder: ptr WwwFormUrlDecoder
-check uri.lpVtbl.get_QueryParsed(uri, addr decoder)
+check uri.vtbl.get_QueryParsed(uri, addr decoder)
 let b = toHstring("b")
-check decoder.lpVtbl.GetFirstValueByName(decoder, b, addr s)
+check decoder.vtbl.GetFirstValueByName(decoder, b, addr s)
 discard WindowsDeleteString(b)
 doAssert take(s) == "two"
 let stringable = queryInterface[IStringable](uri, IID_IStringable)
-check stringable.lpVtbl.ToString(stringable, addr s)
+check stringable.vtbl.ToString(stringable, addr s)
 doAssert take(s) == url
 release(stringable, decoder, uri, uriFactory)
 
@@ -99,38 +99,38 @@ let values = activationFactory[IPropertyValueStatics](
   RuntimeClass_Windows_Foundation_PropertyValue, IID_IPropertyValueStatics
 )
 var boxed: ptr IInspectable
-check values.lpVtbl.CreatePoint(values, Point(X: 1.5, Y: -2.0), addr boxed)
+check values.vtbl.CreatePoint(values, Point(X: 1.5, Y: -2.0), addr boxed)
 var value = queryInterface[IPropertyValue](boxed, IID_IPropertyValue)
 var kind: PropertyType
-check value.lpVtbl.get_Type(value, addr kind)
+check value.vtbl.get_Type(value, addr kind)
 doAssert kind == PropertyType_Point
 var point: Point
-check value.lpVtbl.GetPoint(value, addr point)
+check value.vtbl.GetPoint(value, addr point)
 doAssert point == Point(X: 1.5, Y: -2.0)
 release(value, boxed)
 
 # a Char16 is a WCHAR
-check values.lpVtbl.CreateChar16(values, WCHAR('x'), addr boxed)
+check values.vtbl.CreateChar16(values, WCHAR('x'), addr boxed)
 value = queryInterface[IPropertyValue](boxed, IID_IPropertyValue)
 var character: WCHAR
-check value.lpVtbl.GetChar16(value, addr character)
+check value.vtbl.GetChar16(value, addr character)
 doAssert character == WCHAR('x')
 release(value, boxed)
 
 let rect = Rect(X: 1, Y: 2, Width: 30, Height: 40)
-check values.lpVtbl.CreateRect(values, rect, addr boxed)
+check values.vtbl.CreateRect(values, rect, addr boxed)
 value = queryInterface[IPropertyValue](boxed, IID_IPropertyValue)
 var rectBack: Rect
-check value.lpVtbl.GetRect(value, addr rectBack)
+check value.vtbl.GetRect(value, addr rectBack)
 doAssert rectBack == rect
 release(value, boxed)
 
 var ints = [3'i32, 1, 4, 1, 5]
-check values.lpVtbl.CreateInt32Array(values, uint32(ints.len), addr ints[0], addr boxed)
+check values.vtbl.CreateInt32Array(values, uint32(ints.len), addr ints[0], addr boxed)
 value = queryInterface[IPropertyValue](boxed, IID_IPropertyValue)
 var count: uint32
 var intsBack: ptr int32 # allocated by the callee
-check value.lpVtbl.GetInt32Array(value, addr count, addr intsBack)
+check value.vtbl.GetInt32Array(value, addr count, addr intsBack)
 doAssert count == 5 and cast[ptr array[5, int32]](intsBack)[] == ints
 CoTaskMemFree(intsBack)
 release(value, boxed)
@@ -139,15 +139,15 @@ release(value, boxed)
 var obj = activate(RuntimeClass_Windows_Globalization_Calendar)
 let calendar = queryInterface[Calendar](obj, IID_ICalendar)
 var languages: ptr IVectorView[HSTRING]
-check calendar.lpVtbl.get_Languages(calendar, addr languages)
+check calendar.vtbl.get_Languages(calendar, addr languages)
 var resolved: HSTRING
-check calendar.lpVtbl.get_ResolvedLanguage(calendar, addr resolved)
+check calendar.vtbl.get_ResolvedLanguage(calendar, addr resolved)
 var languageCount, index: uint32
 var found: bool
-check languages.lpVtbl.get_Size(languages, addr languageCount)
-check languages.lpVtbl.IndexOf(languages, resolved, addr index, addr found)
+check languages.vtbl.get_Size(languages, addr languageCount)
+check languages.vtbl.IndexOf(languages, resolved, addr index, addr found)
 doAssert found and index < languageCount
-check languages.lpVtbl.GetAt(languages, index, addr s)
+check languages.vtbl.GetAt(languages, index, addr s)
 doAssert take(s) == take(resolved)
 release(languages, calendar, obj)
 
@@ -164,7 +164,9 @@ static:
     )
 var handlerVtbl: MapChangedEventHandlerVtbl[HSTRING, ptr IInspectable]
 var handler =
-  MapChangedEventHandler[HSTRING, ptr IInspectable](lpVtbl: addr handlerVtbl)
+  MapChangedEventHandler[HSTRING, ptr IInspectable](
+    lpVtbl: cast[ptr IUnknownVtbl](addr handlerVtbl)
+  )
 var handlerRefs: uint32
 var changes: seq[(string, CollectionChange)]
 handlerVtbl.QueryInterface = proc(
@@ -191,9 +193,9 @@ handlerVtbl.Invoke = proc(
   # an error must not unwind into the caller
   var key: HSTRING
   var change: CollectionChange
-  if event.lpVtbl.get_Key(event, addr key) >= 0:
+  if event.vtbl.get_Key(event, addr key) >= 0:
     let name = take(key)
-    if event.lpVtbl.get_CollectionChange(event, addr change) >= 0:
+    if event.vtbl.get_CollectionChange(event, addr change) >= 0:
       changes.add (name, change)
 
 obj = activate(RuntimeClass_Windows_Foundation_Collections_PropertySet)
@@ -203,14 +205,14 @@ let observable = queryInterface[IObservableMap[HSTRING, ptr IInspectable]](
 let map =
   queryInterface[IMap[HSTRING, ptr IInspectable]](obj, IID_IMap_HSTRING_IInspectable)
 var token: EventRegistrationToken
-check observable.lpVtbl.add_MapChanged(observable, addr handler, addr token)
-check values.lpVtbl.CreateInt32(values, 42, addr boxed)
+check observable.vtbl.add_MapChanged(observable, addr handler, addr token)
+check values.vtbl.CreateInt32(values, 42, addr boxed)
 let answer = toHstring("answer")
 var replaced: bool
-check map.lpVtbl.Insert(map, answer, boxed, addr replaced)
+check map.vtbl.Insert(map, answer, boxed, addr replaced)
 doAssert not replaced and changes == @[("answer", CollectionChange_ItemInserted)]
-check observable.lpVtbl.remove_MapChanged(observable, token)
-check map.lpVtbl.Insert(map, answer, boxed, addr replaced)
+check observable.vtbl.remove_MapChanged(observable, token)
+check map.vtbl.Insert(map, answer, boxed, addr replaced)
 doAssert replaced and changes.len == 1 and handlerRefs == 0
 discard WindowsDeleteString(answer)
 release(boxed, map, observable, obj, values)

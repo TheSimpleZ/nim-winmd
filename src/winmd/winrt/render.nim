@@ -83,17 +83,21 @@ func slotType(s: VtableSlot): string =
   fmt"proc({list}): HRESULT {{.mdslot.}}"
 
 func typeDeclaration(d: Declaration): seq[string] =
-  ## The declaration of `d` in a type section.
+  ## The declaration of `d` in winrttypes' type section.
   case d.kind
-  of dkEnum:
-    @[fmt"  {d.name}* = distinct {spell(d.underlying)}"]
+  of dkEnum: # as an unscoped Win32 enum: the integer, and a const per member
+    @[fmt"  {d.name}* {{.mdalias.}} = {spell(d.underlying)}"]
   of dkStruct:
     @[fmt"  {d.name}* {{.mdtype.}} = object"] &
       d.fields.mapIt(fmt"    {it.name}*: {spell(it.ty)}")
   of dkInterface, dkDelegate:
+    # What a pointer to the interface points at. Its vtable is its
+    # namespace's; the base one, IUnknown's methods and IInspectable's, can be
+    # called through this without a cast.
+    let base = if d.kind == dkDelegate: "IUnknownVtbl" else: "IInspectableVtbl"
     @[
       fmt"  {d.name}*{generics(d)} {{.mdinterface.}} = object",
-      fmt"    lpVtbl*: ptr {d.vtableName}{generics(d)}",
+      fmt"    lpVtbl*: ptr {base}",
     ]
   of dkClass:
     if d.defaultInterface.isSome:
@@ -107,6 +111,12 @@ func vtableDeclaration(d: Declaration): seq[string] =
   @[fmt"  {d.vtableName}*{generics(d)} {{.mdvtbl.}} = object of {parent}"] &
     d.slots.mapIt(fmt"    {it.name}*: {slotType(it)}")
 
+func vtableAccessor(d: Declaration): string =
+  ## `this.vtbl`: the vtable of the interface `this` points at, which the
+  ## interface's own `lpVtbl` gives only as its base.
+  let (g, vt) = (generics(d), d.vtableName & generics(d))
+  fmt"template vtbl*{g}(this: ptr {d.name}{g}): ptr {vt} = cast[ptr {vt}](this.lpVtbl)"
+
 func constDeclarations(d: Declaration): seq[string] =
   ## The consts of `d`: an IID, a class name, or enum members.
   case d.kind
@@ -115,30 +125,9 @@ func constDeclarations(d: Declaration): seq[string] =
   of dkClass:
     @[fmt"  {d.classNameConst}*: string = {escape(d.className)}"]
   of dkEnum:
-    d.members.mapIt(fmt"  {it.name}*: {d.name} = {d.name}({it.value})")
+    d.members.mapIt(fmt"  {it.name}*: {d.name} = {it.value}")
   of dkStruct:
     @[]
-
-func enumFuncs(d: Declaration): seq[string] =
-  ## The operations enum `d` borrows from its integer.
-  if d.kind != dkEnum:
-    return
-  let t = d.name
-  result = @[
-    "",
-    fmt"func `==`*(a, b: {t}): bool {{.borrow.}}",
-    fmt"func `$`*(a: {t}): string {{.borrow.}}",
-  ]
-  if d.isFlags:
-    let integer = spell(d.underlying)
-    result.add @[
-      fmt"func `or`*(a, b: {t}): {t} {{.borrow.}}",
-      fmt"func `and`*(a, b: {t}): {t} {{.borrow.}}",
-      fmt"func `not`*(a: {t}): {t} {{.borrow.}}",
-      fmt"func contains*(a, b: {t}): bool =",
-      "  ## True if every bit of `b` is set in `a`.",
-      fmt"  ({integer}(a) and {integer}(b)) == {integer}(b)",
-    ]
 
 # ---------------------------------------------------------------------------
 # modules
@@ -152,46 +141,36 @@ const
   slotPragma = "{.pragma: mdslot, stdcall, raises: [].}"
     ## a C function: raises nothing, so a `=destroy` can release through one
 
-func declarationsFile(k: Module): string =
-  ## winrttypes or a namespace module. Parameterised interfaces come first,
-  ## each beside its vtable: otherwise Nim 2.2 hits an internal error.
-  let parameterised = k.declarations.filterIt(it.isParameterised)
-  let others = k.declarations.filterIt(not it.isParameterised)
-  let types =
-    parameterised.mapIt(typeDeclaration(it) & vtableDeclaration(it)).concat &
-    others.map(typeDeclaration).concat &
-    others.filterIt(it.hasVtable).map(vtableDeclaration).concat
-  let namespaces = k.namespaces.join(", ")
-  let about =
-    if k.namespaces.len > 1:
-      fmt"the namespaces {namespaces} refer to each other in a cycle, and share this module"
-    else:
-      ""
-  let pragmas =
-    if k.kind == mkTypes:
-      @[structPragma]
-    else:
-      @[structPragma, aliasPragma, interfacePragma, vtablePragma, slotPragma]
+func moduleFile(k: Module): string =
+  ## winrttypes, or a namespace module. winrttypes declares every type and an
+  ## enum's members; a namespace module, its vtables — parameterised ones
+  ## first — its IIDs, its classes' names, and `vtbl` for each interface.
+  let (pragmas, types, consts, accessors) =
+    case k.kind
+    of mkTypes:
+      (
+        @[structPragma, aliasPragma, interfacePragma],
+        k.declarations.map(typeDeclaration).concat,
+        k.declarations.filterIt(it.kind == dkEnum).map(constDeclarations).concat,
+        newSeq[string](),
+      )
+    of mkNamespace:
+      let vtables = k.declarations.filterIt(it.hasVtable)
+      (
+        @[vtablePragma, slotPragma],
+        vtables.filterIt(it.isParameterised).map(vtableDeclaration).concat &
+          vtables.filterIt(not it.isParameterised).map(vtableDeclaration).concat,
+        k.declarations.map(constDeclarations).concat,
+        vtables.map(vtableAccessor),
+      )
   let imports = k.imports.join(", ")
   fmt"""
-{header(k.name, about)}
+{header(k.name)}
 import ./[{imports}]
 export {imports}
 """ &
-    paragraph(pragmas) & section("type", types) &
-    section("const", k.declarations.map(constDeclarations).concat) &
-    lines(k.declarations.map(enumFuncs).concat)
-
-func shimFile(k: Module): string =
-  ## A shim: re-exports the module its namespace shares.
-  let (namespace, group) = (k.namespaces[0], k.imports[0])
-  let about =
-    fmt"{namespace} shares {group} with the namespaces it refers to in a cycle"
-  fmt"""
-{header(k.name, about)}
-import ./{group}
-export {group}
-"""
+    paragraph(pragmas) & section("type", types) & section("const", consts) &
+    paragraph(accessors)
 
 func genericsFile(p: Plan): string =
   ## winrtgenerics: the instantiations' IIDs, sorted.
@@ -204,14 +183,6 @@ import ./winrtbase
 export winrtbase
 """ &
     section("const", consts)
-
-func moduleFile(k: Module): string =
-  ## The source of module `k`.
-  case k.kind
-  of mkTypes, mkNamespace:
-    declarationsFile(k)
-  of mkShim:
-    shimFile(k)
 
 func renderModules*(p: Plan): seq[GenModule] =
   ## Every module's name and source.
